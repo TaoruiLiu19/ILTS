@@ -5,6 +5,7 @@ SQLite 数据访问层 — 单连接串行写库，即时 commit。
 import sqlite3
 import os
 from datetime import date
+from uuid import uuid4
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "logistics.db")
 
@@ -85,6 +86,62 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- 优化方案 D1 · 货物台账（挂在 projects 下，1 项目 N 货项）
+CREATE TABLE IF NOT EXISTS cargo_items (
+    item_id      TEXT PRIMARY KEY,
+    project_id   TEXT NOT NULL,
+    seq          INTEGER,
+    item_name    TEXT NOT NULL,
+    qty          INTEGER DEFAULT 1,
+    unit         TEXT,
+    dim_l        REAL, dim_w REAL, dim_h REAL,
+    weight_kg    REAL,
+    gross_m3     REAL,
+    over_flag    INTEGER DEFAULT 0,
+    od_type      TEXT,
+    marks        TEXT,
+    packaging    TEXT,
+    container_no TEXT,
+    seal_no      TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cargo_project ON cargo_items(project_id);
+
+-- 优化方案 D1 · 班轮（1 项目 1 船）
+CREATE TABLE IF NOT EXISTS vessel (
+    vessel_id   TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL UNIQUE,
+    vessel_name TEXT,
+    imo         TEXT,
+    voyage      TEXT,
+    carrier     TEXT,
+    mmsi        TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(project_id)
+);
+
+-- 优化方案 D1 · 船位历史（手动登记，本地回放用）
+CREATE TABLE IF NOT EXISTS vessel_positions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  TEXT NOT NULL,
+    lat         REAL,
+    lon         REAL,
+    actual_eta  TEXT,
+    note        TEXT,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vp_project ON vessel_positions(project_id, id);
+
+-- 优化方案 D2 · 位移历史（回退 / 撤销用）
+CREATE TABLE IF NOT EXISTS shift_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  TEXT NOT NULL,
+    node_id     INTEGER NOT NULL,
+    delta       INTEGER NOT NULL,        -- 正值推迟 / 负值提前
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sh_project ON shift_history(project_id, id);
 """
 
 
@@ -167,6 +224,165 @@ def update_node(project_id, node_id, **kw):
     conn.execute(f"UPDATE nodes SET {sets} WHERE project_id=? AND node_id=?",
                  (*kw.values(), project_id, node_id))
     conn.commit()
+
+
+# ── Cargo items ──
+
+_CARGO_COLS = ("seq", "item_name", "qty", "unit", "dim_l", "dim_w", "dim_h",
+               "weight_kg", "gross_m3", "over_flag", "od_type", "marks",
+               "packaging", "container_no", "seal_no")
+
+
+def insert_cargo_items(project_id, items: list):
+    """items: [{item_name, qty, ...}]，自动补 item_id/seq/over_flag"""
+    conn = get_conn()
+    for i, it in enumerate(items, start=1):
+        item_id = it.get("item_id") or f"item-{uuid4().hex[:10]}"
+        conn.execute(
+            "INSERT INTO cargo_items (item_id, project_id, seq, item_name, qty, unit, "
+            "dim_l, dim_w, dim_h, weight_kg, gross_m3, over_flag, od_type, marks, "
+            "packaging, container_no, seal_no) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (item_id, project_id, it.get("seq", i), it["item_name"], it.get("qty", 1),
+             it.get("unit"), it.get("dim_l"), it.get("dim_w"), it.get("dim_h"),
+             it.get("weight_kg"), it.get("gross_m3"), it.get("over_flag", 0),
+             it.get("od_type"), it.get("marks"), it.get("packaging"),
+             it.get("container_no"), it.get("seal_no"))
+        )
+    conn.commit()
+
+
+def get_cargo_items(project_id):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM cargo_items WHERE project_id=? ORDER BY seq, item_id",
+                        (project_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_cargo_item(item_id, **kw):
+    conn = get_conn()
+    if kw:
+        sets = ", ".join(f"{k}=?" for k in kw)
+        conn.execute(f"UPDATE cargo_items SET {sets} WHERE item_id=?",
+                     (*kw.values(), item_id))
+        conn.commit()
+
+
+def delete_cargo_item(item_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM cargo_items WHERE item_id=?", (item_id,))
+    conn.commit()
+
+
+def delete_cargo_items(project_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM cargo_items WHERE project_id=?", (project_id,))
+    conn.commit()
+
+
+# ── Vessel ──
+
+def upsert_vessel(project_id, vessel_name=None, imo=None, voyage=None,
+                  carrier=None, mmsi=None):
+    """1 项目 1 船：有则更新，无则插入。返回 vessel dict。"""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM vessel WHERE project_id=?",
+                       (project_id,)).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE vessel SET vessel_name=?, imo=?, voyage=?, carrier=?, mmsi=? "
+            "WHERE project_id=?",
+            (vessel_name, imo, voyage, carrier, mmsi, project_id))
+        vessel_id = row["vessel_id"]
+    else:
+        vessel_id = f"ves-{uuid4().hex[:8]}"
+        conn.execute(
+            "INSERT INTO vessel (vessel_id, project_id, vessel_name, imo, voyage, "
+            "carrier, mmsi) VALUES (?,?,?,?,?,?,?)",
+            (vessel_id, project_id, vessel_name, imo, voyage, carrier, mmsi))
+    conn.commit()
+    return get_vessel(project_id)
+
+
+def get_vessel(project_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM vessel WHERE project_id=?",
+                       (project_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ── Vessel positions ──
+
+def insert_vessel_position(project_id, lat=None, lon=None, actual_eta=None, note=None):
+    from datetime import datetime
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO vessel_positions (project_id, lat, lon, actual_eta, note, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (project_id, lat, lon, actual_eta, note,
+         datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+
+
+def get_vessel_positions(project_id, limit=10):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM vessel_positions WHERE project_id=? ORDER BY id DESC LIMIT ?",
+        (project_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Shift history ──
+
+def insert_shift_history(project_id, node_ids, delta, created_at):
+    conn = get_conn()
+    for nid in node_ids:
+        conn.execute(
+            "INSERT INTO shift_history (project_id, node_id, delta, created_at) "
+            "VALUES (?,?,?,?)", (project_id, nid, delta, created_at))
+    conn.commit()
+
+
+def get_shift_history(project_id, limit=20):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM shift_history WHERE project_id=? ORDER BY id DESC LIMIT ?",
+        (project_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def last_shift_group(project_id):
+    """最近一次位移的全部记录（同 created_at 分组），无则返回 []"""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT created_at FROM shift_history WHERE project_id=? "
+        "ORDER BY id DESC LIMIT 1", (project_id,)).fetchone()
+    if not row:
+        return []
+    rows = conn.execute(
+        "SELECT * FROM shift_history WHERE project_id=? AND created_at=? "
+        "ORDER BY node_id", (project_id, row["created_at"])).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Files due recompute（位移联动） ──
+
+def recompute_files_due(project_id, plan):
+    """plan: {node_id: (start_str, end_str)}；按锚点重算 files.due_date"""
+    conn = get_conn()
+    files = conn.execute(
+        "SELECT * FROM files WHERE project_id=? AND due_node_id IS NOT NULL "
+        "AND due_type IS NOT NULL", (project_id,)).fetchall()
+    for f in files:
+        nid = f["due_node_id"]
+        if nid not in plan:
+            continue
+        start_s, end_s = plan[nid]
+        due = end_s if f["due_type"] == "node_end" else start_s
+        conn.execute("UPDATE files SET due_date=? WHERE file_id=?",
+                     (due, f["file_id"]))
+    conn.commit()
+    return len(files)
 
 
 # ── Files ──

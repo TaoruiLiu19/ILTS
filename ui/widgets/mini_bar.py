@@ -1,11 +1,11 @@
 """
-微型三区色块条 — 折叠卡片中部显示项目进度概览
+微型三区色块条 — 折叠卡片中部显示项目进度概览（支持数据刷新，不重复建布局）
 """
 
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QFrame
 from PySide6.QtCore import Qt
 
-from ui.theme import AREA_COLORS, AREA_FG, TEXT_SECONDARY
+from ui.theme import AREA_COLORS, AREA_FG, TEXT_SECONDARY, AREA_TEXT
 
 
 class MiniBar(QWidget):
@@ -16,15 +16,21 @@ class MiniBar(QWidget):
         self.setFixedHeight(34)
         self._nodes = nodes
         self._today = today
-        self._build()
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(4)
+        self._rebuild()
 
-    def _build(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+    def _clear(self):
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-        areas = ["DOME", "SEA", "OVERSEA"]
-        for area in areas:
+    def _rebuild(self):
+        self._clear()
+
+        for area in ("DOME", "SEA", "OVERSEA"):
             area_nodes = [n for n in self._nodes if n["area"] == area]
             if not area_nodes:
                 continue
@@ -45,7 +51,6 @@ class MiniBar(QWidget):
             seg_layout.setContentsMargins(12, 0, 12, 0)
             seg_layout.setSpacing(6)
 
-            from ui.theme import AREA_TEXT
             name = QLabel(AREA_TEXT[area])
             name.setStyleSheet(f"font-size: 11px; color: {AREA_FG[area]}; font-weight: 600;")
             seg_layout.addWidget(name)
@@ -54,16 +59,12 @@ class MiniBar(QWidget):
             label = QLabel(f"{done}/{total}")
             label.setStyleSheet(f"font-size: 11px; color: {TEXT_SECONDARY}; font-weight: 600;")
             seg_layout.addWidget(label)
-            layout.addWidget(seg, stretch=total)
+            self._layout.addWidget(seg, stretch=total)
 
-        layout.addStretch()
+        self._layout.addStretch()
 
     def update_data(self, nodes, today=None):
         self._nodes = nodes
-        self._today = today
-        layout = self.layout()
-        while layout.count():
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._build()
+        if today is not None:
+            self._today = today
+        self._rebuild()

@@ -163,6 +163,28 @@ def pixmap(name, color=ACCENT, size=22):
                            QPointF(s * 0.78, s * 0.70)])
         p.drawPolygon(arrow)
 
+    elif name == "undo":
+        # 撤销：顶部开口的环形箭头（逆时针回退）
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.11))
+        p.drawArc(QRectF(s * 0.20, s * 0.22, s * 0.62, s * 0.56), 130 * 16, 300 * 16)
+        # 环末箭头（约 70° 处），指向左上（回退方向）
+        p.setBrush(QBrush(QColor(c)))
+        p.setPen(Qt.NoPen)
+        head = QPolygonF([QPointF(s * 0.70, s * 0.26),
+                          QPointF(s * 0.46, s * 0.34),
+                          QPointF(s * 0.68, s * 0.48)])
+        p.drawPolygon(head)
+
+    elif name == "clock_hist":
+        # 时钟 + 回拨小箭头（位移历史）
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.11))
+        p.drawEllipse(QRectF(s * 0.12, s * 0.12, s * 0.76, s * 0.76))
+        p.setPen(_pen(c, s * 0.11))
+        p.drawLine(QPointF(s * 0.50, s * 0.50), QPointF(s * 0.50, s * 0.30))
+        p.drawLine(QPointF(s * 0.50, s * 0.50), QPointF(s * 0.70, s * 0.58))
+
     else:  # 默认圆点
         p.drawEllipse(QRectF(s * 0.2, s * 0.2, s * 0.6, s * 0.6))
 

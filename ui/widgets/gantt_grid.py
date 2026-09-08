@@ -19,7 +19,8 @@ from services.clock import get_today
 from services.node_status import compute_node_status
 from ui.theme import (
     AREA_COLORS, AREA_TEXT, AREA_FG, NODE_STATUS_COLORS, get_role_color,
-    GRAY_SOFT, HAIRLINE, TEXT_SECONDARY, TEXT_PRIMARY, TEXT_TERTIARY
+    GRAY_SOFT, HAIRLINE, TEXT_SECONDARY, TEXT_PRIMARY, TEXT_TERTIARY,
+    ACCENT, ORANGE, RED, GREEN
 )
 
 NAME_W = 170
@@ -31,6 +32,7 @@ SEA_MAX_COLS = 5          # 海运压缩后最多占用的列数
 GOLD = "#E8A50C"          # 今日标注 · 金色
 GOLD_BG = "#FFF4D6"       # 今日表头 · 浅金底
 DIVIDER = "#AEB5C3"       # 三条区域之间的分隔竖线
+BOTTLENECK_RATIO = 0.5    # 瓶颈判定：节点时长占全流程 ≥ 50%
 
 AREA_ORDER = ("DOME", "SEA", "OVERSEA")
 
@@ -43,11 +45,15 @@ def _parse(s):
 
 
 class _GanttCanvas(QWidget):
-    def __init__(self, nodes, today, export_port, parent=None):
+    def __init__(self, nodes, today, export_port, over_count=0, buffer_days=4, parent=None):
         super().__init__(parent)
         self._nodes = nodes
         self._today = today
         self._export_port = export_port
+        self._over_count = over_count or 0
+        self._buffer_days = buffer_days or 4
+        self._row_tags = {}         # node_id -> [(text, color), ...]
+        self._bottleneck_id = None
         self._col_dates = []        # 每列对应日期（海运压缩列为 None）
         self._col_area = []         # 每列所属区域
         self._areas = {}            # area -> (start_idx, end_idx)
@@ -165,6 +171,52 @@ class _GanttCanvas(QWidget):
         self._banner_h = BANNER_H if self._port else 0
         self._w = NAME_W + len(col_dates) * COL_WIDTH
         self._h = self._banner_h + HEADER_H * 2 + len(nodes) * ROW_HEIGHT
+
+        self._compute_row_tags()
+
+    def _compute_row_tags(self):
+        """瓶颈 / 风险 / 吊装预警 高亮标签（优化方案 §3.4、§2.1）"""
+        tags = {}
+        nodes = self._nodes
+        if not nodes:
+            self._row_tags = tags
+            return
+
+        # ── 瓶颈：单节点时长占全流程比例 > 阈值 → 标「最长段」 ──
+        starts = [_parse(n["plan_start"]) for n in nodes]
+        ends = [_parse(n["plan_end"]) for n in nodes]
+        total_span = (max(ends) - min(starts)).days
+        longest = None
+        for n in nodes:
+            span = (_parse(n["plan_end"]) - _parse(n["plan_start"])).days
+            if span > 0 and (longest is None or span > longest[1]):
+                longest = (n, span)
+        if (longest and total_span > 0
+                and longest[1] / total_span >= BOTTLENECK_RATIO):
+            self._bottleneck_id = longest[0]["node_id"]
+            tags.setdefault(longest[0]["node_id"], []).append(("⚠ 最长段", ACCENT))
+
+        for n in nodes:
+            nid = n["node_id"]
+            st = compute_node_status(n, self._today)
+            n_tags = tags.get(nid, [])
+
+            # ── 吊装预警：货物台账存在超限项 → 节点3（捆扎固定）标红 ──
+            if nid == 3 and self._over_count > 0:
+                n_tags.append(("吊装预警", RED))
+
+            # ── 风险：逾期 / 缓冲消耗 ──
+            if st == "Overdue":
+                plan_end = _parse(n["plan_end"])
+                late = (self._today - plan_end).days
+                if nid in (9, 10):
+                    used = min(late, self._buffer_days)
+                    n_tags.append((f"已耗缓冲{used}天", ORANGE))
+                n_tags.append((f"逾期{late}天", RED))
+
+            if n_tags:
+                tags[nid] = n_tags
+        self._row_tags = tags
 
     def _build_sea_labels(self):
         """海运压缩列的表头日期刻度：首列开始日期、次列次日、今日列显示当日日期、末列结束日期、其余省略号"""
@@ -309,18 +361,49 @@ class _GanttCanvas(QWidget):
 
             # 名称列
             p.fillRect(QRectF(0, y, NAME_W, ROW_HEIGHT), QColor("#FFFFFF"))
+            row_tags = self._row_tags.get(n["node_id"], [])
+            if row_tags:
+                # 左缘强调条：一眼标出瓶颈 / 风险 / 吊装预警行
+                p.fillRect(QRectF(0, y, 3, ROW_HEIGHT), QColor(row_tags[0][1]))
             role_color = get_role_color(n["role_label"])
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(QColor(role_color)))
-            p.drawRoundedRect(QRectF(8, y + (ROW_HEIGHT - 9) / 2, 9, 9), 3, 3)
+            p.drawRoundedRect(QRectF(10, y + (ROW_HEIGHT - 9) / 2, 9, 9), 3, 3)
 
-            f = QFont("Microsoft YaHei UI", 8)
-            p.setFont(f)
-            p.setPen(QColor(TEXT_PRIMARY))
-            fm = QFontMetrics(f)
             name = f"{n['node_id']}.{n['node_name']}"
-            name = fm.elidedText(name, Qt.ElideRight, NAME_W - 30)
-            p.drawText(QRectF(23, y, NAME_W - 28, ROW_HEIGHT), Qt.AlignVCenter | Qt.AlignLeft, name)
+            if row_tags:
+                # 两行：上行节点名，下行风险/瓶颈标签
+                f = QFont("Microsoft YaHei UI", 9)
+                f.setBold(True)
+                p.setFont(f)
+                p.setPen(QColor(TEXT_PRIMARY))
+                fm = QFontMetrics(f)
+                name_el = fm.elidedText(name, Qt.ElideRight, NAME_W - 32)
+                p.drawText(QRectF(25, y + 2, NAME_W - 30, 20),
+                           Qt.AlignVCenter | Qt.AlignLeft, name_el)
+
+                tf = QFont("Microsoft YaHei UI", 7)
+                tf.setBold(True)
+                p.setFont(tf)
+                fm = QFontMetrics(tf)
+                cx = 25.0
+                for text, color in row_tags:
+                    tw = fm.horizontalAdvance(text) + 6
+                    if cx + tw > NAME_W - 4:
+                        break
+                    p.setPen(QColor(color))
+                    p.drawText(QRectF(cx, y + 20, tw, ROW_HEIGHT - 22),
+                               Qt.AlignVCenter | Qt.AlignLeft, text)
+                    cx += tw
+            else:
+                f = QFont("Microsoft YaHei UI", 8)
+                p.setFont(f)
+                p.setPen(QColor(TEXT_PRIMARY))
+                fm = QFontMetrics(f)
+                name = f"{n['node_id']}.{n['node_name']}"
+                name = fm.elidedText(name, Qt.ElideRight, NAME_W - 30)
+                p.drawText(QRectF(23, y, NAME_W - 28, ROW_HEIGHT),
+                           Qt.AlignVCenter | Qt.AlignLeft, name)
 
             # 节点在压缩海运段内的跨距区间（delta）
             if n_area == "SEA" and sea_start is not None:
@@ -375,13 +458,15 @@ class _GanttCanvas(QWidget):
 class GanttGrid(QScrollArea):
     """甘特网格主控件"""
 
-    def __init__(self, nodes, today=None, readonly=False, export_port=None, parent=None):
+    def __init__(self, nodes, today=None, readonly=False, export_port=None,
+                 over_count=0, buffer_days=4, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(False)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._readonly = readonly
-        self._canvas = _GanttCanvas(nodes, today or get_today(), export_port)
+        self._canvas = _GanttCanvas(nodes, today or get_today(), export_port,
+                                    over_count=over_count, buffer_days=buffer_days)
         self.setWidget(self._canvas)
 
     def auto_height(self):

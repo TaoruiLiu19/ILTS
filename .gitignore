@@ -10,3 +10,4 @@ data/*.db-wal
 # 临时验证截图
 _g3.png
 _gantt.png
+_opt_gantt.png
