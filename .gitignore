@@ -11,6 +11,7 @@ data/*.db-wal
 _g3.png
 _gantt.png
 _opt_gantt.png
+_today_*.png
 
 # 仓库仅保留代码与 README —— 规划文档 / PDF 不入库
 *.pdf
