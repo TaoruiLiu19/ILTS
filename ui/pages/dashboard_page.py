@@ -365,37 +365,20 @@ class ProjectCard(QFrame):
         stat_row.addStretch()
         layout.addLayout(stat_row)
 
-        # 台账 / 班轮动作
-        act_row = QHBoxLayout()
-        act_row.setSpacing(8)
+        # ── 时间轴 · 甘特（瓶颈/风险/吊装预警 高亮） ──
+        gantt_label = QLabel("时间轴")
+        gantt_label.setObjectName("section")
+        layout.addWidget(gantt_label)
 
-        cargo_btn = QPushButton("货物台账")
-        cargo_btn.setObjectName("secondary")
-        cargo_btn.setCursor(Qt.PointingHandCursor)
-        cargo_btn.setToolTip("查看 / 编辑货物清单，登记装箱箱号与封号")
-        cargo_btn.clicked.connect(self._open_cargo)
-        act_row.addWidget(cargo_btn)
+        gantt = GanttGrid(
+            self._nodes, self._today,
+            export_port=self._project.get("export_port"),
+            over_count=self._cargo_over,
+            buffer_days=self._project.get("buffer_days", 4))
+        gantt.setFixedHeight(gantt.auto_height())
+        layout.addWidget(gantt)
 
-        vessel_btn = QPushButton("班轮 · 船位")
-        vessel_btn.setObjectName("secondary")
-        vessel_btn.setCursor(Qt.PointingHandCursor)
-        vessel_btn.setToolTip("维护船名/航次，手工登记船位与实际 ETA（可联动重排）")
-        vessel_btn.clicked.connect(self._open_vessel)
-        act_row.addWidget(vessel_btn)
-        act_row.addStretch()
-
-        undo_btn = QPushButton("撤销上一步位移")
-        undo_btn.setObjectName("ghost")
-        undo_btn.setCursor(Qt.PointingHandCursor)
-        undo_btn.setIcon(icon("undo", ACCENT, 14))
-        undo_btn.setIconSize(QSize(14, 14))
-        has_hist = bool(db.get_shift_history(self._project["project_id"], limit=1))
-        undo_btn.setEnabled(has_hist)
-        undo_btn.clicked.connect(self._undo_shift)
-        act_row.addWidget(undo_btn)
-        layout.addLayout(act_row)
-
-        # ── 动态调整面板（优化方案 D2） ──
+        # ── 动态调整 · 推迟/提前（优化方案 D2） ──
         shift_label = QLabel("动态调整 · 推迟 / 提前")
         shift_label.setObjectName("section")
         layout.addWidget(shift_label)
@@ -444,18 +427,35 @@ class ProjectCard(QFrame):
             self._op_note.setText(self._flash_note)
         layout.addWidget(self._op_note)
 
-        # ── 甘特（瓶颈/风险/吊装预警 高亮） ──
-        gantt_label = QLabel("时间轴")
-        gantt_label.setObjectName("section")
-        layout.addWidget(gantt_label)
+        # ── 台账 / 班轮动作 + 撤销 ──
+        act_row = QHBoxLayout()
+        act_row.setSpacing(8)
 
-        gantt = GanttGrid(
-            self._nodes, self._today,
-            export_port=self._project.get("export_port"),
-            over_count=self._cargo_over,
-            buffer_days=self._project.get("buffer_days", 4))
-        gantt.setFixedHeight(gantt.auto_height())
-        layout.addWidget(gantt)
+        cargo_btn = QPushButton("货物台账")
+        cargo_btn.setObjectName("secondary")
+        cargo_btn.setCursor(Qt.PointingHandCursor)
+        cargo_btn.setToolTip("查看 / 编辑货物清单，登记装箱箱号与封号")
+        cargo_btn.clicked.connect(self._open_cargo)
+        act_row.addWidget(cargo_btn)
+
+        vessel_btn = QPushButton("班轮 · 船位")
+        vessel_btn.setObjectName("secondary")
+        vessel_btn.setCursor(Qt.PointingHandCursor)
+        vessel_btn.setToolTip("维护船名/航次，手工登记船位与实际 ETA（可联动重排）")
+        vessel_btn.clicked.connect(self._open_vessel)
+        act_row.addWidget(vessel_btn)
+        act_row.addStretch()
+
+        undo_btn = QPushButton("撤销上一步位移")
+        undo_btn.setObjectName("ghost")
+        undo_btn.setCursor(Qt.PointingHandCursor)
+        undo_btn.setIcon(icon("undo", ACCENT, 14))
+        undo_btn.setIconSize(QSize(14, 14))
+        has_hist = bool(db.get_shift_history(self._project["project_id"], limit=1))
+        undo_btn.setEnabled(has_hist)
+        undo_btn.clicked.connect(self._undo_shift)
+        act_row.addWidget(undo_btn)
+        layout.addLayout(act_row)
 
         # ── 单证清单 ──
         file_label = QLabel("单证清单")
