@@ -168,6 +168,8 @@ class HomePage(QWidget):
 
     def _refresh_reminders(self):
         today = get_today()
+        from services.node_status import sync_active_projects
+        sync_active_projects()
         projects = db.get_projects_by_status("Active")
         total_reminders = 0
         todo_lines = []

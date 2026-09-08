@@ -15,7 +15,10 @@ from PySide6.QtGui import QCursor
 
 import db
 from config import get_country, get_port
-from services.node_status import compute_node_status, get_current_node, compute_all_status
+from services.node_status import (
+    compute_node_status, get_current_node, compute_all_status,
+    sync_doc_completion, sync_active_projects
+)
 from services.file_checklist import count_files
 from services.cargo_check import summary
 from services.scheduler import apply_shift, undo_last_shift, ShiftError
@@ -112,22 +115,26 @@ class ShiftRow(QFrame):
 class ProjectCard(QFrame):
     """折叠/展开的项目卡片（含 货物·班轮 摘要 + 动态调整面板）"""
 
-    def __init__(self, project, parent=None, on_changed=None):
+    def __init__(self, project, parent=None, on_changed=None, init_state=None, on_state=None):
         super().__init__(parent)
         self._project = project
-        self._expanded = False
         self._today = get_today()
         self._on_changed = on_changed
+        self._on_state = on_state           # 向上级上报折叠状态变化（供跨重建记忆）
+        _st = init_state or {}
+        self._expanded = bool(_st.get("expanded", False))
         self._step_spin = None
         self._op_note = None
         self._flash_note = ""       # 跨重建保留的操作提示
         # 可收纳区块的展开状态（跨重建记忆；甘特恒显不在此列）
-        self._panel_states = {"shift": False, "files": False}
+        self._panel_states = {"shift": bool(_st.get("shift", False)),
+                              "files": bool(_st.get("files", False))}
         # 甘特 ↔ 单证清单 联动状态
         self._focused_node = None      # 点击钉住的节点（跨重建保留）
         self._pop = None               # 节点速览悬浮卡（懒创建）
         self._gantt_grid = None
         self._file_sec = None
+        self._shift_sec = None
         self._file_panel = None
         self._load()
         self.setObjectName("card")
@@ -149,6 +156,8 @@ class ProjectCard(QFrame):
         self._cargo_over = cs["over"]
 
     def _after_change(self):
+        # 位移等变更后按「必填齐 + 已过结束日」规则同步节点完成状态
+        sync_doc_completion(self._project["project_id"])
         self._load()
         self._update_header()
         if self._expanded:
@@ -265,6 +274,8 @@ class ProjectCard(QFrame):
         layout.addWidget(self.expand_area)
 
         self._update_header()
+        if self._expanded:
+            self._apply_expanded()
 
     def _update_header(self):
         # 状态条
@@ -337,6 +348,11 @@ class ProjectCard(QFrame):
 
     def _toggle_expand(self):
         self._expanded = not self._expanded
+        self._apply_expanded()
+        if self._on_state:
+            self._on_state("expanded", self._expanded)
+
+    def _apply_expanded(self):
         if self._expanded:
             self.expand_btn.setText("收起")
             self.expand_btn.setIcon(icon("chevron_up", ACCENT, 14))
@@ -400,8 +416,9 @@ class ProjectCard(QFrame):
             "动态调整 · 推迟 / 提前",
             collapsed=not self._panel_states.get("shift", False))
         shift_sec.expanded_changed.connect(
-            lambda v, k="shift": self._panel_states.__setitem__(k, v))
+            lambda v, k="shift": self._on_panel_state(k, v))
         layout.addWidget(shift_sec)
+        self._shift_sec = shift_sec
 
         tip = QLabel(
             "选中节点 → 点击「提前 − / 推迟 +」按步长整体位移：境内 1–4 联动 ETD 与海运；"
@@ -482,7 +499,7 @@ class ProjectCard(QFrame):
             "单证清单",
             collapsed=not self._panel_states.get("files", False))
         file_sec.expanded_changed.connect(
-            lambda v, k="files": self._panel_states.__setitem__(k, v))
+            lambda v, k="files": self._on_panel_state(k, v))
         layout.addWidget(file_sec)
 
         file_panel = FilePanel(self._files, self._nodes, self._today)
@@ -492,9 +509,8 @@ class ProjectCard(QFrame):
         self._file_sec = file_sec
         self._file_panel = file_panel
 
-        # 重建后恢复点击钉住的节点（展开 + 高亮 + 滚动到该分组）
-        if self._focused_node is not None:
-            file_sec.set_expanded(True)
+        # 重建后恢复点击钉住的节点（仅在单证清单展开时高亮/滚动，不反向强制展开）
+        if self._focused_node is not None and file_sec.is_expanded():
             file_panel.focus_node(self._focused_node)
             file_panel.scroll_to_node(self._focused_node)
 
@@ -597,10 +613,19 @@ class ProjectCard(QFrame):
             db.update_file(file_id, status="submitted", submitted_date=today_str())
         else:
             db.update_file(file_id, status="pending", submitted_date=None)
+        # 单证全交清 + 已过节点结束日 → 自动完成（反之回退）
+        sync_doc_completion(self._project["project_id"])
         self._load()
         self._update_header()
         if self._expanded:
+            # 内容变更不改变「动态调整 / 单证清单」的打开/关闭状态
             self._build_expanded()
+
+    def _on_panel_state(self, key, value):
+        """收纳区块收起/展开时：记录到本地，并上报上级供跨重建记忆"""
+        self._panel_states[key] = value
+        if self._on_state:
+            self._on_state(key, value)
 
 
 class DashboardPage(QWidget):
@@ -609,7 +634,17 @@ class DashboardPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._projects = []
+        # 折叠状态缓存：本次运行内跨重建/跨页面保持（project_id → 状态字典）
+        self._card_state = {}
         self._build()
+
+    def _get_card_state(self, pid):
+        return self._card_state.setdefault(
+            pid, {"expanded": False, "shift": False, "files": False})
+
+    def _on_card_state(self, pid, key, value):
+        """卡片主动上报折叠状态变化 → 存入本页面缓存，供重建时恢复"""
+        self._get_card_state(pid)[key] = value
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -692,6 +727,7 @@ class DashboardPage(QWidget):
         self._render_stats(stats)
 
     def refresh(self):
+        sync_active_projects()               # 进入看板时先同步「必填齐+已过期末」自动完成
         self._projects = db.get_projects_by_status("Active")
         self._render_stats(self._collect_stats())
 
@@ -721,7 +757,12 @@ class DashboardPage(QWidget):
             self.list_layout.insertLayout(0, empty_box)
         else:
             for proj in self._projects:
-                card = ProjectCard(proj, self, on_changed=self._refresh_metrics)
+                pid = proj["project_id"]
+                card = ProjectCard(
+                    proj, self,
+                    on_changed=self._refresh_metrics,
+                    init_state=self._get_card_state(pid),
+                    on_state=lambda k, v, p=pid: self._on_card_state(p, k, v))
                 self.list_layout.insertWidget(self.list_layout.count() - 1, card)
 
     def _metric(self, caption, value, color):

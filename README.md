@@ -59,6 +59,12 @@ py -3.12 app.py        # 或 E:\python\Python312\python.exe app.py
 
 顶栏提供**模拟时钟**按钮（测试用）：可临时改"今日"以提前演示节点 / 单证预警，勾选"恢复真实系统时间"即复位。
 
+### 演示数据（两批）
+- **进行中**：青岛→巴西 Sepetiba 光伏组件，12 节点进行中，可用于测试看板 / 甘特 / 单证提醒 / 位移调整。
+- **已完成**（历史批次）：青岛→巴西 Sepetiba（历史批次），节点全部 Done、单证全部 submitted，进入「已完成」列表，双击可查看**只读甘特**，用于验收"过去的项目"归档功能。
+
+> 两批数据自动灌入无需手建；删除对应 `data/logistics.db*` 重启即可恢复。
+
 ## 验收 / 自测
 
 ```powershell
@@ -75,7 +81,8 @@ QT_QPA_PLATFORM=offscreen python _opt_test_ui.py
 app.py                      # 入口：初始化 DB + 灌入演示数据 + 启动 GUI
 config.py                   # 国家模板 / 出口港子配置（唯一配置源）
 db.py                       # SQLite 数据层（项目/节点/单证/货物/班轮/船位/位移历史）
-mock_data.py                # 演示数据（青岛→巴西光伏组件）
+mock_data.py                # 演示数据（青岛→巴西光伏组件，进行中）
+mock_completed.py           # 演示数据（已完成：历史批次，节点 Done + 单证 submitted）
 services/
   clock.py                  # 统一时钟（测试用可模拟日期）
   scheduler.py              # 排程 + shift_node 推迟/提前（四守卫） + apply/undo

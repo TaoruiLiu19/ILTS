@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
-from services.node_status import compute_node_status
+from services.node_status import compute_node_status, get_current_node
 from ui.theme import (
     GREEN, RED, ORANGE, GRAY, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY, HAIRLINE
 )
@@ -149,22 +149,29 @@ class FilePanel(QScrollArea):
         self._all_rows = []
         self._focused_node = None
 
+        cur = get_current_node(self._nodes, self._today)
+        cur_nid = cur["node_id"] if cur else None
+
         project_files = [f for f in self._files if f.get("node_id") is None]
         if project_files:
-            layout.addWidget(self._make_group("项目级 · 全程常备", project_files, None, None))
+            layout.addWidget(self._make_group("项目级 · 全程常备", project_files, None, None, True))
 
         for nid in sorted(set(f["node_id"] for f in self._files if f.get("node_id") is not None)):
             node_files = [f for f in self._files if f.get("node_id") == nid]
             node_obj = node_map.get(nid)
             node_st = compute_node_status(node_obj, self._today) if node_obj else None
             node_name = node_obj["node_name"] if node_obj else f"节点{nid}"
-            layout.addWidget(self._make_group(f"节点{nid} · {node_name}", node_files, node_st, nid))
+            # 自动收纳：默认仅展开 项目级 + 当前节点 分组，其余折叠
+            expanded = (nid == cur_nid)
+            layout.addWidget(self._make_group(f"节点{nid} · {node_name}", node_files, node_st, nid, expanded))
 
         container.setLayout(layout)
         self.setWidget(container)
 
-    def _make_group(self, title, file_list, node_status, node_id):
+    def _make_group(self, title, file_list, node_status, node_id, expanded=False):
         group = QGroupBox(title)
+        group.setCheckable(True)     # 点击标题勾选即可展开/折叠分组
+        group.setChecked(expanded)   # 自动收纳：控制初始哪个分组展开
         glayout = QVBoxLayout(group)
         glayout.setContentsMargins(8, 12, 8, 4)
         glayout.setSpacing(0)

@@ -212,6 +212,8 @@ class MainWindow(QMainWindow):
 
     def _update_todo_badge(self):
         today = get_today()
+        from services.node_status import sync_active_projects
+        sync_active_projects()      # 待办口径一致：先落定「必填齐+已过期末」自动完成
         projects = db.get_projects_by_status("Active")
         total = 0
         for proj in projects:
@@ -307,6 +309,8 @@ class MainWindow(QMainWindow):
 
     def _show_today_todo(self):
         today = get_today()
+        from services.node_status import sync_active_projects
+        sync_active_projects()
         projects = db.get_projects_by_status("Active")
         all_reminders = {"P0": [], "P1": [], "P2": []}
         for proj in projects:

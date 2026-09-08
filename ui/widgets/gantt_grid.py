@@ -225,31 +225,66 @@ class _GanttCanvas(QWidget):
         self._row_tags = tags
 
     def _build_sea_labels(self):
-        """海运压缩列的表头日期刻度：首列开始日期、次列次日、今日列显示当日日期、末列结束日期、其余省略号"""
+        """
+        海运压缩列表头日期刻度 —— 全局单调、同一天只出现一次：
+          · 首列若与前段（境内末列）同一天 → 该刻度让位给前段，不再重复；
+          · 末列若与后段（境外首列）同一天 → 让位给境外段（10/26 只在境外出现一次）；
+          · 「今日」所在列显示当日日期（与首/末同天则合并）；
+          · 其余列显示 …；从左到右保证严格递增、不倒退、不重复。
+        """
         sea_base = self._areas["SEA"][0]
         n = len(self._sea_ranges)
+        labels = ["…"] * n
+        if n == 0:
+            self._sea_labels = labels
+            return
+
         sea_start = self._sea_start
         sea_end = self._sea_end
-        labels = [""] * n
-        today_rel = None
-        if self._today_idx is not None and self._col_area[self._today_idx] == "SEA":
-            today_rel = self._today_idx - sea_base
+        col_dates = self._col_dates
+
+        # 左右相邻的真实日期列（用于跨段边界去重）
+        prev_date = None
+        if sea_base - 1 >= 0 and col_dates[sea_base - 1] is not None:
+            prev_date = col_dates[sea_base - 1]
+        next_date = None
+        if sea_base + n < len(col_dates) and col_dates[sea_base + n] is not None:
+            next_date = col_dates[sea_base + n]
+
+        ticks = [None] * n          # date 对象
+        if sea_start is not None and (prev_date is None or prev_date != sea_start):
+            ticks[0] = sea_start
+        if sea_end is not None and (next_date is None or next_date != sea_end):
+            ticks[n - 1] = sea_end
+
+        # 「今日」锚点（位于段内时）
+        if (self._today_idx is not None
+                and self._col_area[self._today_idx] == "SEA"):
+            tc = self._today_idx - sea_base
+            if 0 <= tc < n:
+                today = self._today
+                if ticks[tc] is None:
+                    ticks[tc] = today
+                elif ticks[tc] != today and today > ticks[tc]:
+                    ticks[tc] = today      # 今日比端点更“新”，端点刻度让位
+
+        # 从左到右仅保留严格递增的刻度（杜绝倒退/重复）
+        last = None
+        for i in range(n):
+            d = ticks[i]
+            if d is None:
+                continue
+            if last is not None and d <= last:
+                ticks[i] = None
+                continue
+            last = d
 
         def _fmt(d):
             return f"{d.month}/{d.day}"
 
         for i in range(n):
-            if today_rel is not None and i == today_rel:
-                label = _fmt(self._today)
-            elif i == 0:
-                label = _fmt(sea_start) if sea_start else ""
-            elif i == n - 1:
-                label = _fmt(sea_end) if sea_end else ""
-            elif i == 1:
-                label = _fmt(sea_start + timedelta(days=1)) if sea_start else ""
-            else:
-                label = "…"
-            labels[i] = label
+            if ticks[i] is not None:
+                labels[i] = _fmt(ticks[i])
         self._sea_labels = labels
 
     def sizeHint(self):

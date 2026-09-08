@@ -18,6 +18,7 @@ from ui.main_window import MainWindow
 
 # 复用已有的 mock_data
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
+from mock_completed import seed_completed_demo
 from services.file_checklist import bootstrap
 from config import get_port
 
@@ -78,6 +79,7 @@ def main():
 
     # 灌入演示数据
     seed_demo()
+    seed_completed_demo()
 
     # 启动 GUI
     app = QApplication(sys.argv)
