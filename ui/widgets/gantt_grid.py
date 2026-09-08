@@ -12,7 +12,7 @@
 from datetime import date, timedelta
 
 from PySide6.QtWidgets import QWidget, QScrollArea, QSizePolicy
-from PySide6.QtCore import Qt, QRectF, QSize
+from PySide6.QtCore import Qt, Signal, QRectF, QSize, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics
 
 from services.clock import get_today
@@ -65,9 +65,15 @@ class _GanttCanvas(QWidget):
         self._w = NAME_W
         self._h = 0
         self._banner_h = 0
+        # 甘特联动：悬停/点击（由 GanttGrid 注入回调）
+        self._hover_node_id = None
+        self._hover_cb = None       # func(node_dict | None)
+        self._activate_cb = None    # func(node_dict)
         self._compute()
         self.setMinimumSize(self._w, self._h)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
 
     # ── 列模型构建 ──
     def _compute(self):
@@ -271,6 +277,64 @@ class _GanttCanvas(QWidget):
         self._draw_header(p)
         self._draw_rows(p)
         self._draw_dividers(p)
+        self._draw_hover(p)
+
+    # ── 悬停联动 ──
+
+    def _node_at(self, y):
+        """由画布 y 坐标取行对应节点（表头/横幅区返回 None）"""
+        if not self._nodes:
+            return None
+        node_top = self._node_top()
+        if y < node_top:
+            return None
+        idx = int((y - node_top) // ROW_HEIGHT)
+        if 0 <= idx < len(self._nodes):
+            return self._nodes[idx]
+        return None
+
+    def _notify_hover(self, node):
+        nid = node["node_id"] if node else None
+        if nid != self._hover_node_id:
+            self._hover_node_id = nid
+            self.update()
+            if self._hover_cb:
+                self._hover_cb(node)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if event.buttons() == Qt.NoButton:
+            self._notify_hover(self._node_at(event.position().y()))
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if event.button() == Qt.LeftButton:
+            node = self._node_at(event.position().y())
+            if node:
+                self._notify_hover(node)
+                if self._activate_cb:
+                    self._activate_cb(node)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._notify_hover(None)
+
+    def _draw_hover(self, p):
+        """悬停行淡蓝遮罩 + 上下强调线（位于最上层）"""
+        if not self._hover_node_id:
+            return
+        for row, n in enumerate(self._nodes):
+            if n["node_id"] != self._hover_node_id:
+                continue
+            y = self._node_top() + row * ROW_HEIGHT
+            fill = QColor(ACCENT)
+            fill.setAlpha(16)
+            p.fillRect(QRectF(0, y, self._w, ROW_HEIGHT), fill)
+            p.setPen(QPen(QColor(ACCENT), 2))
+            p.drawLine(0, y, self._w, y)
+            p.drawLine(0, y + ROW_HEIGHT - 1, self._w, y + ROW_HEIGHT - 1)
+            p.setPen(Qt.NoPen)
+            return
 
     def _draw_banner(self, p):
         if not self._port:
@@ -456,7 +520,10 @@ class _GanttCanvas(QWidget):
 
 
 class GanttGrid(QScrollArea):
-    """甘特网格主控件"""
+    """甘特网格主控件；悬停/点击节点向外发信号（联动单证清单）"""
+
+    nodeHovered = Signal(object)    # 悬停进入某行: node dict；移出(表头/离开): None
+    nodeActivated = Signal(object)  # 左键单击某行: node dict
 
     def __init__(self, nodes, today=None, readonly=False, export_port=None,
                  over_count=0, buffer_days=4, parent=None):
@@ -467,8 +534,15 @@ class GanttGrid(QScrollArea):
         self._readonly = readonly
         self._canvas = _GanttCanvas(nodes, today or get_today(), export_port,
                                     over_count=over_count, buffer_days=buffer_days)
+        self._canvas._hover_cb = lambda n: self.nodeHovered.emit(n)
+        if not readonly:
+            self._canvas._activate_cb = lambda n: self.nodeActivated.emit(n)
         self.setWidget(self._canvas)
 
     def auto_height(self):
         """返回画布完整高度（含横幅、表头与全部节点行），供外部按需设置显示高度"""
         return self._canvas._h
+
+    # 供联动方程序化高亮/清除（如反向联动）
+    def set_hover_node(self, node):
+        self._canvas._notify_hover(node)

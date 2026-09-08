@@ -199,6 +199,22 @@ QFrame#card {{
 }}
 QFrame#card:hover {{ border: 1px solid #D4E4F9; }}
 
+/* 甘特节点速览悬浮卡 */
+QFrame#popover {{
+    background: {CARD};
+    border: 1px solid #CFDFF0;
+    border-radius: 12px;
+}}
+QFrame#popover QScrollBar:vertical {{
+    width: 8px;
+    background: transparent;
+}}
+QFrame#popover QScrollBar::handle:vertical {{
+    background: #D7D7DC;
+    border-radius: 4px;
+    min-height: 20px;
+}}
+
 /* ── 文本 ── */
 QLabel {{ font-size: 14px; color: {TEXT_PRIMARY}; background: transparent; }}
 QLabel#title {{

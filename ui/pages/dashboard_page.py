@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QFrame, QScrollArea, QSpinBox, QMessageBox
 )
 from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtGui import QCursor
 
 import db
 from config import get_country, get_port
@@ -27,6 +28,7 @@ from ui.icons import icon, pixmap
 from ui.widgets.mini_bar import MiniBar
 from ui.widgets.gantt_grid import GanttGrid
 from ui.widgets.file_panel import FilePanel
+from ui.widgets.node_popover import NodePopover
 from ui.dialogs import CargoDialog, VesselDialog
 from ui.widgets.collapsible import CollapsibleSection
 
@@ -121,6 +123,12 @@ class ProjectCard(QFrame):
         self._flash_note = ""       # 跨重建保留的操作提示
         # 可收纳区块的展开状态（跨重建记忆；甘特恒显不在此列）
         self._panel_states = {"shift": False, "files": False}
+        # 甘特 ↔ 单证清单 联动状态
+        self._focused_node = None      # 点击钉住的节点（跨重建保留）
+        self._pop = None               # 节点速览悬浮卡（懒创建）
+        self._gantt_grid = None
+        self._file_sec = None
+        self._file_panel = None
         self._load()
         self.setObjectName("card")
         card_shadow(self, blur=18, dy=4, alpha=18)
@@ -348,6 +356,8 @@ class ProjectCard(QFrame):
     def _build_expanded(self):
         layout = self.expand_area.layout()
         self._clear_layout(layout)
+        if self._pop:
+            self._pop.hide_card()      # 重建时收起悬浮卡
 
         statuses = compute_all_status(self._nodes, self._today)
         overdue = sum(1 for s in statuses.values() if s == "Overdue")
@@ -379,6 +389,10 @@ class ProjectCard(QFrame):
             over_count=self._cargo_over,
             buffer_days=self._project.get("buffer_days", 4))
         gantt.setFixedHeight(gantt.auto_height())
+        # 甘特 ↔ 单证清单 联动：悬停速览 / 点击聚焦
+        gantt.nodeHovered.connect(self._on_gantt_hover)
+        gantt.nodeActivated.connect(self._on_gantt_activate)
+        self._gantt_grid = gantt
         layout.addWidget(gantt)
 
         # ── 动态调整 · 推迟/提前（优化方案 D2，可收纳，默认收起） ──
@@ -475,6 +489,14 @@ class ProjectCard(QFrame):
         file_panel.setFixedHeight(360)
         file_panel.file_toggled.connect(lambda fid, checked: self._toggle_file(fid, checked))
         file_sec.add_widget(file_panel)
+        self._file_sec = file_sec
+        self._file_panel = file_panel
+
+        # 重建后恢复点击钉住的节点（展开 + 高亮 + 滚动到该分组）
+        if self._focused_node is not None:
+            file_sec.set_expanded(True)
+            file_panel.focus_node(self._focused_node)
+            file_panel.scroll_to_node(self._focused_node)
 
     def _stat_chip(self, caption, value, color, bg):
         box = QFrame()
@@ -490,6 +512,49 @@ class ProjectCard(QFrame):
         val.setStyleSheet(f"font-size: 16px; font-weight: 600; color: {color};")
         h.addWidget(val)
         return box
+
+    # ── 甘特 ↔ 单证清单 联动 ──
+
+    def _ensure_popover(self):
+        if self._pop is None:
+            self._pop = NodePopover(self.window())
+        return self._pop
+
+    def _node_files(self, nid):
+        return [f for f in self._files if f.get("node_id") == nid]
+
+    def _on_gantt_hover(self, node):
+        """悬停：弹速览卡；文件区展开时同步高亮对应分组（收起时不强行展开）"""
+        pop = self._ensure_popover()
+        if node is None:
+            pop.hide_card()
+            if self._focused_node is None and self._file_panel is not None:
+                self._file_panel.clear_focus()
+            return
+        pop.show_node(node, self._node_files(node["node_id"]), QCursor.pos())
+        if (self._file_panel is not None and self._file_sec is not None
+                and self._file_sec.is_expanded()):
+            self._file_panel.focus_node(node["node_id"])
+
+    def _on_gantt_activate(self, node):
+        """单击：展开文件区并钉住该节点分组；再次点击同一节点取消钉住"""
+        nid = node["node_id"]
+        pop = self._ensure_popover()
+        if self._focused_node == nid and self._file_sec is not None:
+            # 再次点击同节点 → 取消钉住并收起文件区
+            self._focused_node = None
+            if self._file_panel is not None:
+                self._file_panel.clear_focus()
+            self._file_sec.set_expanded(False)
+            pop.hide_card()
+            return
+        self._focused_node = nid
+        pop.show_node(node, self._node_files(nid), QCursor.pos())
+        if self._file_sec is not None and not self._file_sec.is_expanded():
+            self._file_sec.set_expanded(True)
+        if self._file_panel is not None:
+            self._file_panel.focus_node(nid)
+            self._file_panel.scroll_to_node(nid)
 
     # ── 动作 ──
 

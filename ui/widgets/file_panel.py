@@ -122,7 +122,10 @@ class FileRow(QFrame):
 
 
 class FilePanel(QScrollArea):
+    """单证清单面板 + 甘特联动支持（focus_node / scroll_to_node）"""
+
     file_toggled = Signal(int, bool)
+    FOCUS_BG = "#EAF3FF"     # 悬停/选中节点时对应单证行的浅蓝底
 
     def __init__(self, files, nodes=None, today=None, readonly=False, parent=None):
         super().__init__(parent)
@@ -131,6 +134,8 @@ class FilePanel(QScrollArea):
         self._nodes = nodes or []
         self._today = today or get_today()
         self._readonly = readonly
+        self._all_rows = []          # [(row_widget, node_id), ...] 行引用缓存
+        self._focused_node = None    # 当前高亮节点
         self._build()
 
     def _build(self):
@@ -141,22 +146,24 @@ class FilePanel(QScrollArea):
         layout.setSpacing(8)
 
         node_map = {n["node_id"]: n for n in self._nodes}
+        self._all_rows = []
+        self._focused_node = None
 
         project_files = [f for f in self._files if f.get("node_id") is None]
         if project_files:
-            layout.addWidget(self._make_group("项目级 · 全程常备", project_files, None))
+            layout.addWidget(self._make_group("项目级 · 全程常备", project_files, None, None))
 
         for nid in sorted(set(f["node_id"] for f in self._files if f.get("node_id") is not None)):
             node_files = [f for f in self._files if f.get("node_id") == nid]
             node_obj = node_map.get(nid)
             node_st = compute_node_status(node_obj, self._today) if node_obj else None
             node_name = node_obj["node_name"] if node_obj else f"节点{nid}"
-            layout.addWidget(self._make_group(f"节点{nid} · {node_name}", node_files, node_st))
+            layout.addWidget(self._make_group(f"节点{nid} · {node_name}", node_files, node_st, nid))
 
         container.setLayout(layout)
         self.setWidget(container)
 
-    def _make_group(self, title, file_list, node_status):
+    def _make_group(self, title, file_list, node_status, node_id):
         group = QGroupBox(title)
         glayout = QVBoxLayout(group)
         glayout.setContentsMargins(8, 12, 8, 4)
@@ -166,8 +173,36 @@ class FilePanel(QScrollArea):
             row = FileRow(f, node_status, self._today, self._readonly)
             row.toggled.connect(self.file_toggled.emit)
             glayout.addWidget(row)
+            self._all_rows.append((row, node_id))
 
         return group
+
+    # ── 甘特联动：高亮某节点对应行 / 滚动到该分组 ──
+
+    def _apply_row_style(self, row, focus):
+        base = (f"FileRow {{ border-bottom: 1px solid {HAIRLINE};"
+                f" background: {self.FOCUS_BG if focus else 'transparent'};"
+                " border-top-left-radius: 0; }")
+        row.setStyleSheet(base)
+
+    def focus_node(self, node_id):
+        """高亮 node_id 对应全部单证行；其他行还原。node_id=None 或空则不置灰仅清除。"""
+        self._focused_node = node_id
+        for row, nid in self._all_rows:
+            mark = (nid is not None and nid == node_id)
+            self._apply_row_style(row, mark)
+
+    def clear_focus(self):
+        self._focused_node = None
+        for row, _ in self._all_rows:
+            self._apply_row_style(row, False)
+
+    def scroll_to_node(self, node_id):
+        """滚动让该节点分组首行可见（面板可见时有效）"""
+        for row, nid in self._all_rows:
+            if nid == node_id:
+                self.ensureWidgetVisible(row, 0, 60)
+                return
 
     def refresh(self, files, nodes=None):
         self._files = files
