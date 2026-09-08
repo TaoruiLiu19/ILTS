@@ -11,3 +11,12 @@ data/*.db-wal
 _g3.png
 _gantt.png
 _opt_gantt.png
+
+# 仓库仅保留代码与 README —— 规划文档 / PDF 不入库
+*.pdf
+/优化.md
+/开发.md
+/开发文档_V6.md
+/巴西清关.md
+/国内报关.md
+/国内海港.md
