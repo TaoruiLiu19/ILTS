@@ -1,0 +1,12 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+
+# 运行时数据库
+data/logistics.db*
+data/*.db-shm
+data/*.db-wal
+
+# 临时验证截图
+_g3.png
+_gantt.png

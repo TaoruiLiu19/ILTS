@@ -1,0 +1,140 @@
+"""
+国家模板（节点/泳道/单证清单）+ 出口港子配置
+单一来源：后续新增国家/港口只改本文件，DB 与 UI 无需改结构。
+"""
+
+COUNTRIES = {
+    "BR": {
+        "name": "巴西",
+        "name_en": "Brazil",
+        "flag": "🇧🇷",
+        "buffer_days": 4,
+        "nodes": [
+            {"id": 1, "name": "办理出口报关", "duration": 3, "area": "DOME", "role": "报关行/货代",
+             "remark": "需登录中国电子口岸签订三方协议"},
+            {"id": 2, "name": "安排港口操作/集港", "duration": 1, "area": "DOME", "role": "货代/港口",
+             "remark": "集港通知、港杂费"},
+            {"id": 3, "name": "执行捆扎固定", "duration": 1, "area": "DOME", "role": "码头/理货",
+             "remark": "件杂货船自吊机，吊装能力≥100t，臂长≥36m"},
+            {"id": 4, "name": "实施货物装船", "duration": 1, "area": "DOME", "role": "船公司/码头",
+             "remark": "装船单、大副收据"},
+            {"id": 5, "name": "进行海上运输", "duration": 45, "area": "SEA", "role": "船公司(中远海运)",
+             "remark": "航线青岛→上海→香港→马六甲→Colombo→CapeTown→巴西Sepetiba，直航36-40天；正本提单"},
+            {"id": 6, "name": "办理到港换单", "duration": 1, "area": "OVERSEA", "role": "境外代理/船代",
+             "remark": "提前7个工作日核对正本提单副本"},
+            {"id": 7, "name": "申请进口许可LI", "duration": 1, "area": "OVERSEA", "role": "境外代理/进口商",
+             "remark": "Siscomex申请，须装运前完成否则罚款30%CIF；有效期60天"},
+            {"id": 8, "name": "进行进口清关申报", "duration": 3, "area": "OVERSEA", "role": "境外代理/报关行",
+             "remark": "需3-7工作日；清关前付清II/IPI/PIS/COFINS/ICMS等"},
+            {"id": 9, "name": "执行海关查验/放行", "duration": 1, "area": "OVERSEA", "role": "海关/境外代理",
+             "remark": "绿/黄/红/灰四通道；不可预清关，须货到后清关"},
+            {"id": 10, "name": "支付临时堆存费", "duration": 1, "area": "OVERSEA", "role": "境外代理/码头",
+             "remark": "堆存费收据、放行通知单"},
+            {"id": 11, "name": "安排境外内陆运输", "duration": 2, "area": "OVERSEA", "role": "境外代理/运输公司",
+             "remark": "5轴半挂车，200hp以上MACK/MAN重型牵引车"},
+            {"id": 12, "name": "完成工地交付", "duration": 1, "area": "OVERSEA", "role": "收货人/项目组",
+             "remark": "签收单、随车单据"},
+        ],
+        "files_project": [
+            {"doc_name": "《项目日报》", "doc_type": "required", "owner_dept": "操作组", "copies": None,
+             "due_node_id": None, "due_type": None, "remind_before_days": 1, "note": "全程每日"},
+            {"doc_name": "《物流动态跟踪表》", "doc_type": "required", "owner_dept": "操作组", "copies": None,
+             "due_node_id": None, "due_type": None, "remind_before_days": 7, "note": "全程每周"},
+            {"doc_name": "《项目进度报告》", "doc_type": "required", "owner_dept": "项目部", "copies": None,
+             "due_node_id": None, "due_type": None, "remind_before_days": 7, "note": "全程每周"},
+            {"doc_name": "《批次实施计划》", "doc_type": "required", "owner_dept": "项目部", "copies": None,
+             "due_node_id": 1, "due_type": "node_start", "remind_before_days": 3, "note": "节点1开始前，提前3天提醒"},
+            {"doc_name": "《人员安排计划》", "doc_type": "required", "owner_dept": "项目部", "copies": None,
+             "due_node_id": 1, "due_type": "node_start", "remind_before_days": 3, "note": "节点1开始前，提前3天提醒"},
+        ],
+        "files_nodes": [
+            {"node_id": 1, "doc_name": "出口报关单", "doc_type": "required", "owner_dept": "报关行", "copies": 1,
+             "due_type": "node_end", "remind_before_days": 3, "note": "中国电子口岸三方协议"},
+            {"node_id": 1, "doc_name": "商业发票", "doc_type": "required", "owner_dept": "发货人", "copies": 3,
+             "due_type": "node_end", "remind_before_days": 3, "note": "需公证件，英/葡双语，注明HS/原产地/贸易术语"},
+            {"node_id": 1, "doc_name": "装箱单", "doc_type": "required", "owner_dept": "发货人", "copies": 3,
+             "due_type": "node_end", "remind_before_days": 3, "note": "详细列明每箱货物"},
+            {"node_id": 1, "doc_name": "出口合同", "doc_type": "required", "owner_dept": "收货人", "copies": 1,
+             "due_type": "node_end", "remind_before_days": 3, "note": ""},
+            {"node_id": 1, "doc_name": "出口许可证(如需)", "doc_type": "optional", "owner_dept": "相关部门", "copies": None,
+             "due_type": "node_end", "remind_before_days": 3, "note": "涉证商品需备"},
+            {"node_id": 2, "doc_name": "集港通知", "doc_type": "required", "owner_dept": "货代", "copies": None,
+             "due_type": "node_start", "remind_before_days": 2, "note": ""},
+            {"node_id": 2, "doc_name": "港杂费单据", "doc_type": "required", "owner_dept": "港口", "copies": None,
+             "due_type": "node_start", "remind_before_days": 2, "note": ""},
+            {"node_id": 3, "doc_name": "绑扎加固方案", "doc_type": "required", "owner_dept": "码头/理货", "copies": None,
+             "due_type": "node_start", "remind_before_days": 2, "note": "吊机≥100t/臂长≥36m"},
+            {"node_id": 3, "doc_name": "装载计划", "doc_type": "required", "owner_dept": "码头", "copies": None,
+             "due_type": "node_start", "remind_before_days": 2, "note": ""},
+            {"node_id": 4, "doc_name": "装船单", "doc_type": "required", "owner_dept": "码头", "copies": None,
+             "due_type": "node_end", "remind_before_days": 2, "note": ""},
+            {"node_id": 4, "doc_name": "大副收据(理货单)", "doc_type": "required", "owner_dept": "大副/理货", "copies": 1,
+             "due_type": "node_end", "remind_before_days": 2, "note": ""},
+            {"node_id": 5, "doc_name": "正本海运提单", "doc_type": "required", "owner_dept": "船公司", "copies": 3,
+             "due_type": "node_start", "remind_before_days": 3, "note": "需在nodes表备注列标航线"},
+            {"node_id": 5, "doc_name": "随船箱单/发票", "doc_type": "required", "owner_dept": "发货人", "copies": None,
+             "due_type": "node_start", "remind_before_days": 3, "note": ""},
+            {"node_id": 5, "doc_name": "《保险申购单》", "doc_type": "required", "owner_dept": "商务部", "copies": None,
+             "due_type": "node_start", "remind_before_days": 3, "note": "发运前投保，CIF条款"},
+            {"node_id": 6, "doc_name": "正本提单(换单)", "doc_type": "required", "owner_dept": "船代", "copies": 1,
+             "due_type": "node_start", "remind_before_days": 7, "note": "提前7个工作日核对副本"},
+            {"node_id": 6, "doc_name": "换单费收据", "doc_type": "required", "owner_dept": "船代", "copies": None,
+             "due_type": "node_end", "remind_before_days": 2, "note": ""},
+            {"node_id": 7, "doc_name": "非自动进口许可证申请书", "doc_type": "required", "owner_dept": "境外代理/进口商", "copies": None,
+             "due_type": "node_start", "remind_before_days": 3, "note": "Siscomex申请"},
+            {"node_id": 7, "doc_name": "原产地证(如需)", "doc_type": "optional", "owner_dept": "发货人", "copies": 1,
+             "due_type": "node_start", "remind_before_days": 3, "note": "优惠关税FORM A/CO"},
+            {"node_id": 7, "doc_name": "ANVISA/INMETRO认证", "doc_type": "required", "owner_dept": "相关部门", "copies": None,
+             "due_type": "node_start", "remind_before_days": 3, "note": "巴西强制认证(涉及产品时)"},
+            {"node_id": 7, "doc_name": "CPF/CNPJ税号", "doc_type": "required", "owner_dept": "收货人", "copies": None,
+             "due_type": "node_start", "remind_before_days": 3, "note": "进口商税号"},
+            {"node_id": 8, "doc_name": "进口证", "doc_type": "required", "owner_dept": "收货人", "copies": 2,
+             "due_type": "node_end", "remind_before_days": 3, "note": "外贸部签发；1正1复；有效期60天"},
+            {"node_id": 8, "doc_name": "进口税费缴纳凭证", "doc_type": "required", "owner_dept": "报关行", "copies": None,
+             "due_type": "node_end", "remind_before_days": 3, "note": "II/IPI/PIS/COFINS/ICMS"},
+            {"node_id": 9, "doc_name": "查验通知", "doc_type": "required", "owner_dept": "海关", "copies": None,
+             "due_type": "node_start", "remind_before_days": 2, "note": "四通道：绿2/黄7-10/红15/灰20天-6月"},
+            {"node_id": 9, "doc_name": "熏蒸证书(木包装)", "doc_type": "required", "owner_dept": "发货人", "copies": 1,
+             "due_type": "node_start", "remind_before_days": 2, "note": "木质包装必检；含非木质包装证明"},
+            {"node_id": 9, "doc_name": "危险品证明(如有)", "doc_type": "optional", "owner_dept": "发货人", "copies": 1,
+             "due_type": "node_start", "remind_before_days": 2, "note": ""},
+            {"node_id": 9, "doc_name": "商品检验证明(二手/机器)", "doc_type": "optional", "owner_dept": "发货人", "copies": None,
+             "due_type": "node_start", "remind_before_days": 2, "note": "二手/机器装置需出具"},
+            {"node_id": 10, "doc_name": "堆存费收据", "doc_type": "required", "owner_dept": "码头", "copies": None,
+             "due_type": "node_end", "remind_before_days": 2, "note": "超期仓储风险控制"},
+            {"node_id": 10, "doc_name": "放行通知单", "doc_type": "required", "owner_dept": "海关/码头", "copies": None,
+             "due_type": "node_end", "remind_before_days": 2, "note": ""},
+            {"node_id": 11, "doc_name": "送货通知", "doc_type": "required", "owner_dept": "境外代理", "copies": None,
+             "due_type": "node_start", "remind_before_days": 2, "note": ""},
+            {"node_id": 11, "doc_name": "提货单D/O", "doc_type": "required", "owner_dept": "船代", "copies": 1,
+             "due_type": "node_start", "remind_before_days": 2, "note": "需核对清关单证一致"},
+            {"node_id": 12, "doc_name": "签收单", "doc_type": "required", "owner_dept": "收货人", "copies": None,
+             "due_type": "node_end", "remind_before_days": 2, "note": ""},
+            {"node_id": 12, "doc_name": "随车单据", "doc_type": "required", "owner_dept": "运输公司", "copies": None,
+             "due_type": "node_end", "remind_before_days": 2, "note": ""},
+        ],
+    }
+}
+
+PORTS = {
+    "QD": {
+        "name": "青岛港",
+        "platform_notes": {
+            1: '报关单证经「国际贸易单一窗口→业务应用→口岸执法申报→货物申报」；企业备案经单一窗口或「互联网+海关」；签订电子口岸无纸化三方协议 [singlewindow.cn / chinaport.gov.cn]',
+            2: '港口操作经「青岛港云港通」办理装卸合同、流向填报、网上缴费 [qingdao-port.net]',
+            3: "件杂货吊装能力>=100t且臂长>=36m",
+            4: '涉及危险品时提前7天提交危险货物申报(危包证+MSDS)至就近海事局，经「海事一网通办」[zwfw.msa.gov.cn]；电子提单可由船公司经GSBN区块链平台签发',
+        },
+        "banner": "🌐 出口港：青岛港 · 集港/查验/危险品申报见各节点线上平台备注（云港通 qingdao-port.net）",
+    },
+}
+
+
+def get_country(country_code):
+    return COUNTRIES.get(country_code, {})
+
+
+def get_port(port_code):
+    if not port_code:
+        return None
+    return PORTS.get(port_code, None)
