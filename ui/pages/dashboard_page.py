@@ -28,6 +28,7 @@ from ui.widgets.mini_bar import MiniBar
 from ui.widgets.gantt_grid import GanttGrid
 from ui.widgets.file_panel import FilePanel
 from ui.dialogs import CargoDialog, VesselDialog
+from ui.widgets.collapsible import CollapsibleSection
 
 
 def _parse(s):
@@ -118,6 +119,8 @@ class ProjectCard(QFrame):
         self._step_spin = None
         self._op_note = None
         self._flash_note = ""       # 跨重建保留的操作提示
+        # 可收纳区块的展开状态（跨重建记忆；甘特恒显不在此列）
+        self._panel_states = {"shift": False, "files": False}
         self._load()
         self.setObjectName("card")
         card_shadow(self, blur=18, dy=4, alpha=18)
@@ -378,17 +381,20 @@ class ProjectCard(QFrame):
         gantt.setFixedHeight(gantt.auto_height())
         layout.addWidget(gantt)
 
-        # ── 动态调整 · 推迟/提前（优化方案 D2） ──
-        shift_label = QLabel("动态调整 · 推迟 / 提前")
-        shift_label.setObjectName("section")
-        layout.addWidget(shift_label)
+        # ── 动态调整 · 推迟/提前（优化方案 D2，可收纳，默认收起） ──
+        shift_sec = CollapsibleSection(
+            "动态调整 · 推迟 / 提前",
+            collapsed=not self._panel_states.get("shift", False))
+        shift_sec.expanded_changed.connect(
+            lambda v, k="shift": self._panel_states.__setitem__(k, v))
+        layout.addWidget(shift_sec)
 
         tip = QLabel(
             "选中节点 → 点击「提前 − / 推迟 +」按步长整体位移：境内 1–4 联动 ETD 与海运；"
             "海运 5 联动 ETA 与境外全段；境外 6–12 口岸整段平移。已完成节点不可位移。")
         tip.setWordWrap(True)
         tip.setStyleSheet(f"font-size: 11px; color: {TEXT_TERTIARY};")
-        layout.addWidget(tip)
+        shift_sec.add_widget(tip)
 
         ctl_row = QHBoxLayout()
         ctl_row.addWidget(QLabel("步长"))
@@ -400,10 +406,10 @@ class ProjectCard(QFrame):
         ctl_row.addWidget(step)
         self._step_spin = step
         ctl_row.addStretch()
-        ctl_row.addWidget(QLabel("位移后单证建议提交日自动重算"))
-        ctl_row.itemAt(ctl_row.count() - 1).widget().setStyleSheet(
-            f"font-size: 11px; color: {TEXT_TERTIARY};")
-        layout.addLayout(ctl_row)
+        note_hint = QLabel("位移后单证建议提交日自动重算")
+        note_hint.setStyleSheet(f"font-size: 11px; color: {TEXT_TERTIARY};")
+        ctl_row.addWidget(note_hint)
+        shift_sec.add_layout(ctl_row)
 
         shift_scroll = QScrollArea()
         shift_scroll.setWidgetResizable(True)
@@ -418,14 +424,14 @@ class ProjectCard(QFrame):
             blay.insertWidget(blay.count() - 1, ShiftRow(
                 n, self._today, self._shift_node))
         shift_scroll.setWidget(body)
-        layout.addWidget(shift_scroll)
+        shift_sec.add_widget(shift_scroll)
 
         self._op_note = QLabel("")
         self._op_note.setWordWrap(True)
         self._op_note.setStyleSheet(f"font-size: 11px; color: {ACCENT};")
         if self._flash_note:
             self._op_note.setText(self._flash_note)
-        layout.addWidget(self._op_note)
+        shift_sec.add_widget(self._op_note)
 
         # ── 台账 / 班轮动作 + 撤销 ──
         act_row = QHBoxLayout()
@@ -457,15 +463,18 @@ class ProjectCard(QFrame):
         act_row.addWidget(undo_btn)
         layout.addLayout(act_row)
 
-        # ── 单证清单 ──
-        file_label = QLabel("单证清单")
-        file_label.setObjectName("section")
-        layout.addWidget(file_label)
+        # ── 单证清单（可收纳，默认收起） ──
+        file_sec = CollapsibleSection(
+            "单证清单",
+            collapsed=not self._panel_states.get("files", False))
+        file_sec.expanded_changed.connect(
+            lambda v, k="files": self._panel_states.__setitem__(k, v))
+        layout.addWidget(file_sec)
 
         file_panel = FilePanel(self._files, self._nodes, self._today)
         file_panel.setFixedHeight(360)
         file_panel.file_toggled.connect(lambda fid, checked: self._toggle_file(fid, checked))
-        layout.addWidget(file_panel)
+        file_sec.add_widget(file_panel)
 
     def _stat_chip(self, caption, value, color, bg):
         box = QFrame()

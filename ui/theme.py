@@ -213,6 +213,20 @@ QLabel#section {{
     color: {TEXT_PRIMARY};
     padding-top: 6px;
 }}
+QPushButton#collapsibleHead {{
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    text-align: left;
+    padding: 7px 4px;
+    font-size: 15px;
+    font-weight: 600;
+    color: {TEXT_PRIMARY};
+}}
+QPushButton#collapsibleHead:hover {{
+    background: {GRAY_SOFT};
+    color: {ACCENT};
+}}
 QLabel#empty {{ font-size: 15px; color: {TEXT_TERTIARY}; padding: 40px; }}
 
 /* ── 输入控件 ── */
