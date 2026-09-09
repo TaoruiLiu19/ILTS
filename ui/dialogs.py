@@ -2,6 +2,7 @@
 主看板辅助对话框（优化方案 D1/D2）：
   · CargoDialog —— 货物台账查看 / 编辑 / 装箱(箱号·封号)登记
   · VesselDialog —— 班轮信息维护 + 船位手动登记（可联动重排境外段）
+  · TodayTodoDialog —— 今日待办弹窗（级别分组 · 白卡条目）
 """
 
 from datetime import date
@@ -9,7 +10,8 @@ from datetime import date
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QDateEdit,
-    QGroupBox, QFormLayout, QMessageBox, QListWidget, QDoubleSpinBox
+    QGroupBox, QFormLayout, QMessageBox, QListWidget, QDoubleSpinBox,
+    QScrollArea, QFrame, QWidget
 )
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtGui import QColor
@@ -450,3 +452,134 @@ class VesselDialog(QDialog):
 
     def result_note(self):
         return self._result_note
+
+
+class TodayTodoDialog(QDialog):
+    """今日待办弹窗：级别分组（色点+计数）+ 白卡条目，苹果极简风"""
+
+    # (级别, 组名, 组色)
+    _GROUPS = (("P0", "需处理", "#FF3B30"),
+               ("P1", "进行中提醒", "#FF9500"),
+               ("P2", "今日启动", "#007AFF"))
+
+    def __init__(self, all_reminders, today, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("今日待办")
+        self.setMinimumWidth(500)
+        self.setMaximumWidth(560)
+        self._all = all_reminders
+        self._today = today
+        self._build()
+
+    def _build(self):
+        from ui.icons import icon
+        from ui.theme import (ACCENT, CARD, BORDER, TEXT_PRIMARY,
+                              TEXT_SECONDARY, TEXT_TERTIARY)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 16)
+        lay.setSpacing(12)
+
+        # ── 头部：日历图标 + 标题 + 日期 ──
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(icon("calendar", ACCENT, 26).pixmap(26, 26))
+        head.addWidget(icon_lbl)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title = QLabel("今日待办")
+        title.setStyleSheet(
+            f"font-size: 19px; font-weight: 600; color: {TEXT_PRIMARY};")
+        title_col.addWidget(title)
+        date_lbl = QLabel(self._today.strftime("%Y-%m-%d"))
+        date_lbl.setStyleSheet(f"font-size: 12px; color: {TEXT_TERTIARY};")
+        title_col.addWidget(date_lbl)
+        head.addLayout(title_col)
+        head.addStretch()
+        lay.addLayout(head)
+
+        # ── 滚动内容区 ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+            "QScrollBar:vertical { width: 8px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: #D7D7DC;"
+            " border-radius: 4px; min-height: 20px; }"
+            "QScrollBar::add-line, QScrollBar::sub-line { height: 0; }")
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(2, 0, 8, 0)
+        body_lay.setSpacing(8)
+
+        has_any = False
+        for level, gname, gcolor in self._GROUPS:
+            items = self._all.get(level, [])
+            if not items:
+                continue
+            has_any = True
+            gh = QHBoxLayout()
+            gh.setSpacing(7)
+            dot = QLabel()
+            dot.setFixedSize(9, 9)
+            dot.setStyleSheet(f"background: {gcolor}; border-radius: 4px;")
+            gh.addWidget(dot)
+            gl = QLabel(gname)
+            gl.setStyleSheet(
+                f"font-size: 13px; font-weight: 600; color: {TEXT_SECONDARY};")
+            gh.addWidget(gl)
+            cnt = QLabel(str(len(items)))
+            cnt.setStyleSheet(
+                f"background: {gcolor}; color: #FFFFFF; font-size: 11px;"
+                f" font-weight: 600; padding: 1px 8px; border-radius: 8px;")
+            gh.addWidget(cnt)
+            gh.addStretch()
+            body_lay.addSpacing(4)
+            body_lay.addLayout(gh)
+            for r in items:
+                body_lay.addWidget(self._row_card(r["project"], r["msg"]))
+
+        if not has_any:
+            empty_lbl = QLabel("今日暂无待办，一切正常")
+            empty_lbl.setAlignment(Qt.AlignCenter)
+            empty_lbl.setStyleSheet(
+                f"font-size: 14px; color: {TEXT_TERTIARY}; padding: 34px 0;")
+            body_lay.addWidget(empty_lbl)
+
+        body_lay.addStretch()
+        scroll.setWidget(body)
+        scroll.setMaximumHeight(360)
+        lay.addWidget(scroll, 1)
+
+        # ── 底部：关闭 ──
+        foot = QHBoxLayout()
+        close_btn = QPushButton("关闭")
+        close_btn.setStyleSheet(
+            f"background: {ACCENT}; color: #FFFFFF; border: none;"
+            f" border-radius: 10px; padding: 8px 28px;"
+            f" font-size: 13px; font-weight: 600;")
+        close_btn.clicked.connect(self.accept)
+        foot.addStretch()
+        foot.addWidget(close_btn)
+        lay.addLayout(foot)
+
+    def _row_card(self, project, msg):
+        from ui.theme import CARD, BORDER, TEXT_PRIMARY, TEXT_SECONDARY
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background: {CARD}; border: 1px solid {BORDER};"
+            f" border-radius: 12px; }}")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 9, 14, 9)
+        v.setSpacing(3)
+        pj = QLabel(project)
+        pj.setStyleSheet(
+            f"font-size: 12px; font-weight: 600; color: {TEXT_SECONDARY};")
+        v.addWidget(pj)
+        msg_lbl = QLabel(msg)
+        msg_lbl.setWordWrap(True)
+        msg_lbl.setStyleSheet(f"font-size: 13px; color: {TEXT_PRIMARY};")
+        v.addWidget(msg_lbl)
+        return card

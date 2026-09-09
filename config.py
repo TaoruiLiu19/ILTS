@@ -116,18 +116,12 @@ COUNTRIES = {
     }
 }
 
-PORTS = {
-    "QD": {
-        "name": "青岛港",
-        "platform_notes": {
-            1: '报关单证经「国际贸易单一窗口→业务应用→口岸执法申报→货物申报」；企业备案经单一窗口或「互联网+海关」；签订电子口岸无纸化三方协议 [singlewindow.cn / chinaport.gov.cn]',
-            2: '港口操作经「青岛港云港通」办理装卸合同、流向填报、网上缴费 [qingdao-port.net]',
-            3: "件杂货吊装能力>=100t且臂长>=36m",
-            4: '涉及危险品时提前7天提交危险货物申报(危包证+MSDS)至就近海事局，经「海事一网通办」[zwfw.msa.gov.cn]；电子提单可由船公司经GSBN区块链平台签发',
-        },
-        "banner": "🌐 出口港：青岛港 · 集港/查验/危险品申报见各节点线上平台备注（云港通 qingdao-port.net）",
-    },
-}
+# ── 出口港（国内海港）薄壳 ──
+# 港口权威数据已迁至 services/ports_cn.py（单一可编辑数据文件），
+# 此处 PORTS / get_port 仅为兼容既有调用方，内部保持一致。
+from services import ports as _ports
+
+PORTS = {str(p["key"]): p for p in _ports.list_ports()}
 
 
 def get_country(country_code):
@@ -135,6 +129,7 @@ def get_country(country_code):
 
 
 def get_port(port_code):
+    """返回港口条目 dict 或 None（兼容旧结构：含 name/platform_notes/banner/codes 等）。"""
     if not port_code:
         return None
-    return PORTS.get(port_code, None)
+    return _ports.get_port(port_code)

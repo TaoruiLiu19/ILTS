@@ -18,7 +18,7 @@ from ui.pages.home_page import HomePage
 from ui.pages.dashboard_page import DashboardPage
 from ui.pages.new_project_page import NewProjectPage
 from ui.pages.completed_page import CompletedPage
-from services.reminder import compute_reminders, format_reminders, count_total
+from services.reminder import compute_reminders, count_total
 
 
 NAV_ITEMS = [
@@ -320,11 +320,11 @@ class MainWindow(QMainWindow):
             for level in all_reminders:
                 all_reminders[level].extend(reminders[level])
 
-        msg = format_reminders(all_reminders, today)
         total = count_total(all_reminders)
 
         if total > 0:
-            QMessageBox.information(self, "今日待办", msg)
+            from ui.dialogs import TodayTodoDialog
+            TodayTodoDialog(all_reminders, today, self).exec()
             self.tray.showMessage("今日待办", f"共 {total} 项待办", QSystemTrayIcon.Information)
 
     def _show_toast(self, msg):

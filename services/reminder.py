@@ -92,14 +92,14 @@ def format_reminders(all_reminders, today=None):
     elif isinstance(today, str):
         today = _parse(today)
 
-    lines = [f"📋 今日待办 · {today.strftime('%Y-%m-%d')}", ""]
+    lines = [f"今日待办 · {today.strftime('%Y-%m-%d')}", ""]
 
     p0 = all_reminders.get("P0", [])
     p1 = all_reminders.get("P1", [])
     p2 = all_reminders.get("P2", [])
 
     if not p0 and not p1 and not p2:
-        lines.append("✅ 今日暂无待办，一切正常。")
+        lines.append("今日暂无待办，一切正常。")
         return "\n".join(lines)
 
     if p0:

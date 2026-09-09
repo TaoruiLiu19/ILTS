@@ -185,6 +185,153 @@ def pixmap(name, color=ACCENT, size=22):
         p.drawLine(QPointF(s * 0.50, s * 0.50), QPointF(s * 0.50, s * 0.30))
         p.drawLine(QPointF(s * 0.50, s * 0.50), QPointF(s * 0.70, s * 0.58))
 
+    elif name == "anchor":
+        # 锚：顶部圆环 + 中轴 + 横杆 + 底部弯钩
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.10))
+        p.drawEllipse(QRectF(s * 0.38, s * 0.10, s * 0.24, s * 0.24))
+        p.drawLine(QPointF(s * 0.50, s * 0.34), QPointF(s * 0.50, s * 0.86))
+        p.drawLine(QPointF(s * 0.24, s * 0.54), QPointF(s * 0.76, s * 0.54))
+        path = QPainterPath()
+        path.arcTo(QRectF(s * 0.22, s * 0.56, s * 0.56, s * 0.56), 180, 180)
+        p.drawPath(path)
+
+    elif name == "note":
+        # 备注文档：圆角矩形 + 两条横线 + 右下圆点标记
+        p.drawPath(_rt(s * 0.16, s * 0.10, s * 0.68, s * 0.80, s * 0.08))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen("#FFFFFF", s * 0.075))
+        p.drawLine(QPointF(s * 0.26, s * 0.32), QPointF(s * 0.74, s * 0.32))
+        p.drawLine(QPointF(s * 0.26, s * 0.50), QPointF(s * 0.60, s * 0.50))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(c)))
+        p.drawEllipse(QPointF(s * 0.70, s * 0.72), s * 0.10, s * 0.10)
+
+    elif name == "pin":
+        # 定位针：实心圆头 + 三角尾
+        p.drawEllipse(QRectF(s * 0.26, s * 0.10, s * 0.48, s * 0.48))
+        tri = QPolygonF([QPointF(s * 0.20, s * 0.54),
+                         QPointF(s * 0.80, s * 0.54),
+                         QPointF(s * 0.50, s * 0.92)])
+        p.drawPolygon(tri)
+
+    elif name == "crane":
+        # 浮吊：A 型门架 + 吊索 + 吊钩
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.09))
+        p.drawLine(QPointF(s * 0.26, s * 0.88), QPointF(s * 0.50, s * 0.18))
+        p.drawLine(QPointF(s * 0.74, s * 0.88), QPointF(s * 0.50, s * 0.18))
+        p.drawLine(QPointF(s * 0.34, s * 0.36), QPointF(s * 0.66, s * 0.36))
+        p.drawLine(QPointF(s * 0.50, s * 0.18), QPointF(s * 0.50, s * 0.58))
+        p.drawArc(QRectF(s * 0.38, s * 0.56, s * 0.24, s * 0.26), 0, 180)
+
+    elif name == "wave":
+        # 波浪：两道起伏曲线（航道吃水）
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.10))
+        path = QPainterPath()
+        path.moveTo(s * 0.10, s * 0.36)
+        path.cubicTo(s * 0.20, s * 0.26, s * 0.30, s * 0.26, s * 0.40, s * 0.36)
+        path.cubicTo(s * 0.50, s * 0.46, s * 0.60, s * 0.46, s * 0.70, s * 0.36)
+        path.cubicTo(s * 0.78, s * 0.28, s * 0.86, s * 0.28, s * 0.90, s * 0.36)
+        p.drawPath(path)
+        path = QPainterPath()
+        path.moveTo(s * 0.10, s * 0.66)
+        path.cubicTo(s * 0.20, s * 0.56, s * 0.30, s * 0.56, s * 0.40, s * 0.66)
+        path.cubicTo(s * 0.50, s * 0.76, s * 0.60, s * 0.76, s * 0.70, s * 0.66)
+        path.cubicTo(s * 0.78, s * 0.58, s * 0.86, s * 0.58, s * 0.90, s * 0.66)
+        p.drawPath(path)
+
+    elif name == "warehouse":
+        # 库场：三角屋顶 + 矩形仓体 + 门洞
+        roof = QPolygonF([QPointF(s * 0.14, s * 0.42),
+                          QPointF(s * 0.50, s * 0.12),
+                          QPointF(s * 0.86, s * 0.42)])
+        p.drawPolygon(roof)
+        p.drawPath(_rt(s * 0.14, s * 0.42, s * 0.72, s * 0.46, s * 0.05))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen("#FFFFFF", s * 0.07))
+        p.drawRect(QRectF(s * 0.42, s * 0.60, s * 0.16, s * 0.28))
+
+    elif name == "compass":
+        # 罗盘：外圆 + 上实下空的菱形指针
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.10))
+        p.drawEllipse(QRectF(s * 0.10, s * 0.10, s * 0.80, s * 0.80))
+        p.setBrush(QBrush(QColor(c)))
+        p.setPen(Qt.NoPen)
+        top = QPolygonF([QPointF(s * 0.50, s * 0.20),
+                         QPointF(s * 0.72, s * 0.50),
+                         QPointF(s * 0.50, s * 0.50)])
+        p.drawPolygon(top)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.08))
+        bot = QPolygonF([QPointF(s * 0.50, s * 0.80),
+                         QPointF(s * 0.28, s * 0.50),
+                         QPointF(s * 0.50, s * 0.50)])
+        p.drawPolygon(bot)
+
+    elif name == "coord":
+        # 经纬度：圆 + 十字准星
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.09))
+        p.drawEllipse(QRectF(s * 0.10, s * 0.10, s * 0.80, s * 0.80))
+        p.drawLine(QPointF(s * 0.10, s * 0.50), QPointF(s * 0.90, s * 0.50))
+        p.drawLine(QPointF(s * 0.50, s * 0.10), QPointF(s * 0.50, s * 0.90))
+
+    elif name == "tide":
+        # 潮汐：上弦月 + 波浪线
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.09))
+        path = QPainterPath()
+        path.arcTo(QRectF(s * 0.28, s * 0.10, s * 0.44, s * 0.44), 135, 270)
+        p.drawPath(path)
+        path = QPainterPath()
+        path.moveTo(s * 0.12, s * 0.72)
+        path.cubicTo(s * 0.22, s * 0.64, s * 0.32, s * 0.64, s * 0.42, s * 0.72)
+        path.cubicTo(s * 0.52, s * 0.80, s * 0.62, s * 0.80, s * 0.72, s * 0.72)
+        path.cubicTo(s * 0.80, s * 0.66, s * 0.86, s * 0.66, s * 0.90, s * 0.72)
+        p.drawPath(path)
+
+    elif name == "info":
+        # 信息：圆 + 点 + 竖（"i"）
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.10))
+        p.drawEllipse(QRectF(s * 0.10, s * 0.10, s * 0.80, s * 0.80))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(c)))
+        p.drawEllipse(QPointF(s * 0.50, s * 0.36), s * 0.07, s * 0.07)
+        p.drawPath(_rt(s * 0.46, s * 0.52, s * 0.08, s * 0.24, s * 0.04))
+
+    elif name == "warn":
+        # 警告：三角 + 白色感叹号
+        tri = QPolygonF([QPointF(s * 0.50, s * 0.10),
+                         QPointF(s * 0.92, s * 0.86),
+                         QPointF(s * 0.08, s * 0.86)])
+        p.drawPolygon(tri)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen("#FFFFFF", s * 0.10))
+        p.drawLine(QPointF(s * 0.50, s * 0.32), QPointF(s * 0.50, s * 0.60))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush("#FFFFFF"))
+        p.drawEllipse(QPointF(s * 0.50, s * 0.74), s * 0.06, s * 0.06)
+
+    elif name == "close":
+        # 关闭：两条交叉圆头线
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.12))
+        p.drawLine(QPointF(s * 0.22, s * 0.22), QPointF(s * 0.78, s * 0.78))
+        p.drawLine(QPointF(s * 0.78, s * 0.22), QPointF(s * 0.22, s * 0.78))
+
+    elif name == "chevron_right":
+        path = QPainterPath()
+        path.moveTo(s * 0.36, s * 0.22)
+        path.lineTo(s * 0.64, s * 0.50)
+        path.lineTo(s * 0.36, s * 0.78)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, s * 0.13))
+        p.drawPath(path)
+
     else:  # 默认圆点
         p.drawEllipse(QRectF(s * 0.2, s * 0.2, s * 0.6, s * 0.6))
 

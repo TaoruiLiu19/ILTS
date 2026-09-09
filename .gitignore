@@ -2,22 +2,17 @@
 __pycache__/
 *.py[cod]
 
-# 运行时数据库
-data/logistics.db*
-data/*.db-shm
-data/*.db-wal
+# 运行时数据库与本地数据目录
+data/
 
-# 临时验证截图
-_g3.png
-_gantt.png
-_opt_gantt.png
-_today_*.png
-
-# 仓库仅保留代码与 README —— 规划文档 / PDF 不入库
+# 仓库仅保留代码与 README —— 设计/业务文档、PDF 不入库（仅本地）
+*.md
+!README.md
 *.pdf
-/优化.md
-/开发.md
-/开发文档_V6.md
-/巴西清关.md
-/国内报关.md
-/国内海港.md
+
+# 本地临时截图与一次性调试脚本（不入库）
+_*.png
+_map_check.py
+_map_geo_check.py
+_todo_dlg_test.py
+_ui_redesign_test.py
