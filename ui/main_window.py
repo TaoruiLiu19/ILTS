@@ -92,7 +92,7 @@ class MainWindow(QMainWindow):
 
         sb_layout.addStretch()
 
-        version = QLabel("v6.5 · Demo")
+        version = QLabel("v6.7 · Demo")
         version.setObjectName("logoSub")
         version.setAlignment(Qt.AlignCenter)
         sb_layout.addWidget(version)

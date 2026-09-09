@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QWidget, QScrollArea, QSizePolicy
 from PySide6.QtCore import Qt, Signal, QRectF, QSize, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics
 
+from ui.widgets.scoped_scroll import ScopedScrollArea
 from services.clock import get_today
 from services.node_status import compute_node_status
 from ui.theme import (
@@ -330,9 +331,18 @@ class _GanttCanvas(QWidget):
 
     def _notify_hover(self, node):
         nid = node["node_id"] if node else None
-        if nid != self._hover_node_id:
+        old = self._hover_node_id
+        if nid != old:
+            # 只重绘 移出旧行 + 移入新行 两个局部区域，避免悬停移动时整幅大画布重绘（性能）
             self._hover_node_id = nid
-            self.update()
+            for target in (old, nid):
+                if target is None:
+                    continue
+                for row, n in enumerate(self._nodes):
+                    if n["node_id"] == target:
+                        y = self._node_top() + row * ROW_HEIGHT
+                        self.update(0, y, self._w, ROW_HEIGHT)
+                        break
             if self._hover_cb:
                 self._hover_cb(node)
 
@@ -554,7 +564,7 @@ class _GanttCanvas(QWidget):
             p.drawLine(x, top, x, bottom)
 
 
-class GanttGrid(QScrollArea):
+class GanttGrid(ScopedScrollArea):
     """甘特网格主控件；悬停/点击节点向外发信号（联动单证清单）"""
 
     nodeHovered = Signal(object)    # 悬停进入某行: node dict；移出(表头/离开): None

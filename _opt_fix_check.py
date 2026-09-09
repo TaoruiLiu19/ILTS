@@ -1,4 +1,4 @@
-"""离屏回归：1)可收纳区默认收起且内容变更不改开合 2)海运压缩表头单调去重 3)单证齐+过期末→自动完成"""
+"""离屏回归：1)右栏标签/开合状态在内容变更后保持 2)海运压缩表头单调去重 3)单证齐+过期末→自动完成"""
 import os, sys
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,33 +44,36 @@ from ui.widgets.collapsible import CollapsibleSection
 from ui.pages.dashboard_page import DashboardPage
 from services.node_status import sync_active_projects
 
-# ── 1) 收纳默认状态与内容变更保持 ──
-print("== 1) 收纳默认 + 内容变更不改变开合 ==")
+# ── 1) 右栏标签状态与内容变更保持 ──
+print("== 1) 右栏默认标签 + 内容变更不改变标签/开合 ==")
 dp = DashboardPage(); dp.resize(1440, 900); dp.show(); dp.refresh(); app.processEvents()
 card = next(dp.list_layout.itemAt(i).widget()
             for i in range(dp.list_layout.count())
             if dp.list_layout.itemAt(i).widget()
             and dp.list_layout.itemAt(i).widget().__class__.__name__ == "ProjectCard")
 card._toggle_expand(); app.processEvents()
-sections = [dp.list_layout.itemAt(i).widget() for i in range(dp.list_layout.count())]
-secs = [card._shift_sec, card._file_sec]
-check(secs[0] is not None and secs[1] is not None and
-      not secs[0].is_expanded() and not secs[1].is_expanded(), "动态调整/单证清单默认收起")
+check(card._tab == "files", "默认停在「单证清单」标签")
+check(card._right_collapsed is False, "右栏默认展开")
+check(card._file_panel is not None, "单证面板已构建")
 
-# 展开单证清单 → 提交一张单证 → 仍保持展开
-secs[1].set_expanded(True); app.processEvents()
+# 提交一张单证 → 标签与开合状态均不变，且行对象不被销毁
+fp = card._file_panel
+row_before = fp._row_order[0][0]
 fid1 = next(f["file_id"] for f in db.get_files(pid)
             if f.get("node_id") == 1 and f["doc_type"] == "required")
 card._toggle_file(fid1, True); app.processEvents()
-check(card._file_sec.is_expanded(), "提交单证后「单证清单」保持展开（不再自动收起）")
-check(not card._shift_sec.is_expanded(), "「动态调整」仍保持收起")
+check(card._tab == "files", "提交单证后仍停在「单证清单」标签")
+check(card._right_collapsed is False, "提交单证后右栏保持展开")
+check(card._file_panel is fp and fp._row_order[0][0] is row_before,
+      "提交单证后面板/行对象未被重建（卡死根因回归）")
 
-# 收起后再提交另一张 → 仍收起
-card._file_sec.set_expanded(False); app.processEvents()
+# 收起右栏后再提交另一张 → 仍收起
+card._toggle_right(); app.processEvents()
+check(card._right_collapsed is True, "可收起右栏")
 fid2 = next(f["file_id"] for f in db.get_files(pid)
             if f.get("node_id") == 1 and f["doc_type"] == "required" and f["file_id"] != fid1)
 card._toggle_file(fid2, True); app.processEvents()
-check(not card._file_sec.is_expanded(), "收起状态提交单证后不被自动展开")
+check(card._right_collapsed is True, "收起状态提交单证后不被自动展开")
 
 # ── 2) 海运压缩表头单调去重 ──
 print("== 2) 海运压缩表头 单调/去重 ==")

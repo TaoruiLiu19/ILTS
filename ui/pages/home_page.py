@@ -120,23 +120,25 @@ class HomePage(QWidget):
         layout.addWidget(self.reminder_bar)
 
         # 四入口卡片（2×2）
-        cards_grid = QGridLayout(self)
+        cards_grid = QGridLayout()
         cards_grid.setSpacing(18)
 
+        # 卡片先挂到 grid_wrap 下（避免父级已持有布局时再被重设父级）
+        grid_wrap = QWidget()
         self.card_active = EntryCard("dashboard", "进行中项目", "", 0,
-                                     "box", GREEN, "#E8F8EC", self)
+                                     "dashboard", ACCENT, "#EAF3FF", grid_wrap)
         self.card_active.clicked.connect(lambda k: self.navigate.emit(k))
 
         self.card_completed = EntryCard("completed", "已完成项目", "", 0,
-                                        "folder", TEXT_SECONDARY, "#F2F2F7", self)
+                                        "folder", TEXT_SECONDARY, "#F2F2F7", grid_wrap)
         self.card_completed.clicked.connect(lambda k: self.navigate.emit(k))
 
         self.card_new = EntryCard("new_project", "新建项目", "创建新的物流跟踪", 0,
-                                  "new", ACCENT, "#EAF3FF", self)
+                                  "new", ACCENT, "#EAF3FF", grid_wrap)
         self.card_new.clicked.connect(lambda k: self.navigate.emit(k))
 
         self.card_report = EntryCard("report", "生成报告", "日报 / 周报 · 一键导出", 0,
-                                     "doc", ACCENT, "#EAF3FF", self)
+                                     "doc", ACCENT, "#EAF3FF", grid_wrap)
         self.card_report.clicked.connect(lambda k: self.navigate.emit(k))
 
         cards_grid.addWidget(self.card_active, 0, 0)
@@ -145,7 +147,6 @@ class HomePage(QWidget):
         cards_grid.addWidget(self.card_report, 1, 1)
         cards_grid.setColumnStretch(0, 1)
         cards_grid.setColumnStretch(1, 1)
-        grid_wrap = QWidget()
         grid_wrap.setLayout(cards_grid)
         layout.addWidget(grid_wrap)
 

@@ -6,6 +6,105 @@
 
 ---
 
+## 本次优化（v6.7）
+
+### 1. 统一时钟：模拟时间下所有入库时间戳跟随模拟日期
+
+**问题**：用顶栏「测试时间」切到模拟日期后，节点/单证按模拟日期判定，但**操作日志、船位、位移历史、报告生成时间仍记真实时间**——同一批操作里有的对、有的错。
+
+**根因**：模拟时间只被用来算「今日」（`get_today()`），而写库的时间戳直接调 `datetime.now()`，绕过了模拟时钟（共 5 处）。
+
+**修复**：`services/clock.py` 新增统一时间入口，5 处全部改走它：
+
+```python
+def get_now() -> datetime:        # 模拟日期 + 真实时分秒
+def get_now_str(fmt) -> str
+```
+
+| 位置 | 原先 | 现在 |
+| :-- | :-- | :-- |
+| `services/oplog.py::_now()` | `datetime.now()` | `get_now_str()` |
+| `db.py::insert_op_log()` | 同上 | 同上 |
+| `db.py::insert_vessel_position()` | 同上 | 同上 |
+| `services/scheduler.py::apply_shift()` | 同上 | 同上（仍保留微秒） |
+| `services/reporting.py::build_report()` | 同上 | 同上 |
+
+> **语义**：日期跟随模拟日期，**时分秒仍取真实时钟**——同一天内多次操作的先后顺序保持真实，不会全部挤在 00:00。`set_simulated_today()` 现在也接受 `datetime`。
+
+### 2. 报告：概览去掉健康状态，待办改名并加「单证」列
+
+- 「总体概览」删除 `（健康状态：绿 X · 黄 X · 红 X）`，只留**进行中项目数**与**节点完成率**。健康度计算仍供智能摘要使用（「N 个出现延误预警」）。
+- 板块「未来待办」→ **下一个工作日待办**（日报）／**下周待办**（周报，窗口是下周整周，叫"下一个工作日"不准确）。
+- 待办表格由 4 列扩为 **5 列**：日期 / 优先级 / 项目 / 节点 / **单证**；「单证」列为该节点**未提交的必填单证**（无则 `—`）。窗口逻辑保持不变（次日 + 周末提前预警）。
+- 「单证最新状态」板块去掉表前那句说明文字，直接出表。
+- **章节号改为自动递增**：条件板块被跳过时不再跳号（原先周报无风险会从「六、本期摘要」直接跳到「八、与上周对比」）。
+
+### 3. 测试辅助脚本 `tools/reset_ops.py`
+
+只清 `op_log`，其他表一律不动（单证勾选状态、节点完成状态、位移历史全部保留），详见下文「测试辅助」。
+
+### 4. 本次验收
+
+```powershell
+py -3.12 -X utf8 _clock_check.py     # 统一时钟：模拟时间下各表时间戳跟随模拟日期
+py -3.12 -X utf8 _sim_e2e.py         # 端到端：设模拟时间 → 勾选单证 → 日志/单证日期跟随
+py -3.12 -X utf8 _reset_check.py     # reset_ops 只清 op_log，逐表比对
+```
+
+---
+
+## 上一轮优化（v6.6）
+
+### 1. 修复主看板「单证清单勾选/取消卡死崩溃」（P0）
+
+**根因**（离屏脚本可复现）：`ProjectCard._toggle_file()` → `FilePanel.refresh()` → `FilePanel._build()` → `QScrollArea.setWidget(新容器)`。
+`setWidget()` 会**同步析构旧内容控件**，而被析构的正是刚刚发出 `toggled` 信号的那个 `QCheckBox` —— 信号回调栈里销毁发射者，shiboken 抛 `Internal C++ object (QCheckBox) already deleted`，真实 GUI 下表现为勾选后卡死或整个进程崩溃。
+
+**修复**（`ui/widgets/file_panel.py` 重写）：
+
+| 措施 | 说明 |
+| :-- | :-- |
+| 容器只建一次 | 滚动区内容容器在构造时 `setWidget()` 一次，之后**永不再调用** |
+| 原地增量刷新 | 新增 `FilePanel.update_files()`：按 `file_id` 定位行，只改该行文案/颜色/勾选态与所属分组的状态标签 |
+| 程序化改勾选一律 `blockSignals` | 杜绝「刷新 → 触发 toggled → 再刷新」的信号回环 |
+| 重建也只清布局 | 万一行集合变化需重建，也只 `_clear_body()` 后重填，绝不换容器 |
+
+**效果**：37 行单证逐个勾选/取消全部通过，单次耗时由 **130–160 ms 降到 22–30 ms**（约 5–7 倍），连续快速切换 40 次无异常。
+
+### 2. 单证入库口径改为「每个单证每天只留最后一次状态」
+
+`op_log` 不再堆积审计底稿行，改为**同一项目 · 同一单证 · 同一天只保留 1 行最终态**：
+
+- `kind` 即最终动作：`file_submit`（提交）/ `file_withdraw`（撤销）；
+- `created_at` 即该次动作时间；
+- 同一天反复勾选/取消 → 库里始终只有 1 行，覆盖式写入（删同日旧行再写最终态）；
+- **跨天各留一行**，报告仍可按天回溯。
+
+配套改动：
+
+| 位置 | 改动 |
+| :-- | :-- |
+| `db.py` | `op_log` 去掉 `valid` 列；新增 `_migrate_op_log()` 旧库迁移（删 `valid=0` 行 → `DROP COLUMN valid` → 按 (项目,单证,日) 去重）；新增 `delete_op_log()` / `last_file_actions()`；新增 `idx_opl_subject` |
+| `services/oplog.py` | 文件类改为「先删同日同单证行，再写最终态」；位移类保持当日净收敛与撤销分离不变 |
+| `services/reporting.py` | 动态收敛改为按 (项目,单证,**日**) 收敛（跨天不折叠）；新增「单证最新状态」板块 |
+
+> 迁移在启动时自动执行且幂等：真实旧库 28 行（含 8 行被覆盖底稿 + 同日重复撤交）→ 10 行，每（单证, 日）恰好 1 行。
+
+### 3. 顺手修掉启动页布局告警
+
+`HomePage` 的四张入口卡原先以 `HomePage` 为父级创建、后又交给 `grid_wrap` 的 `QGridLayout`，Qt 会在重设父级时打印 `QLayout: Attempting to add QLayout "" to HomePage "", which already has a layout`。现改为先建 `grid_wrap`、卡片直接挂到它下面，启动日志干净。
+
+### 4. 验收
+
+```powershell
+py -3.12 -X utf8 _repro_toggle.py           # 勾选/取消回归（崩溃 + 耗时 + 落库口径）
+py -3.12 -X utf8 _mig_check.py              # 旧库迁移（在真实库副本上验证：去 valid / 去重 / 幂等）
+py -3.12 -X utf8 _verify_filepanel.py       # 面板原地刷新不销毁控件
+py -3.12 -X utf8 _home_check.py             # 启动页四卡构建（布局告警回归）
+```
+
+---
+
 ## 功能特性
 
 ### 出发国内港口查询与地图定位
@@ -38,7 +137,7 @@
 - **自动完成**：某节点**必填单证全部提交且已过 plan_end** → 自动视为完成（逾期消失）；撤勾必填单证自动回退。
 
 ### 主看板布局
-展开项目卡片：统计字牌 → **时间轴甘特（恒显）** → 可收纳「动态调整 · 推迟/提前」→ 台账/班轮按钮行 → 可收纳「单证清单」；两大块默认收起，点击标题开合，**内容变更（勾选单证/位移等）不改变开合状态**；展开状态跨页面记忆。
+展开项目卡片：统计字牌 → **时间轴甘特（恒显）** → 右侧可收纳面板（标签切换「动态调整 · 推迟/提前」/「单证清单」）→ 台账/班轮按钮行；面板可整体收起为窄条，**内容变更（勾选单证/位移等）不改变标签与开合状态**；展开状态跨页面记忆。
 
 ### 提醒与归档
 - 今日待办（托盘徽章 + 今日待办对话框）、逾期/缓冲预警、单证超建议日与缺失提醒。
@@ -48,9 +147,23 @@
 - 启动页四卡（2×2）新增「生成报告」入口；侧栏导航亦新增「生成报告」独立页。
 - **预览 → 生成两步（职责分离）**：先「预览报告」只渲染同源 HTML，满意后再点「生成」弹摘要确认框直接导出，两按钮互不自动触发。
 - **Word(.docx) 优先、纯文本降级**：装了 `python-docx` 导出带标题/表格/红色逾期缺失的 docx；未装则导出同名 .txt 并以【逾期】/【缺失】标红。文件写 `data/reports/`（已入库 .gitignore）。
-- 报告板块：总体概览（健康绿/黄/红）+ 未完成清单（缺证红标）+ 操作动态（日报到小时 / 周报按天分组）+ 未来待办（日报含周末提前预警；周报取下周自然周一~周日窗口）+ 智能摘要 +（周报）与上周对比 + 下周风险（实时读 cargo 当前值判超限）。
-- 操作日志 `op_log`：在新建/位移/撤销/自动完成/提交撤交单证/船位/货物变更等关键动作埋点；文件提交审计覆盖（同日同表单只余最新有效，底稿全留）、位移当日净收敛、撤销单独成条。
+- 报告板块：总体概览（进行中项目数 + 节点完成率）+ 未完成清单（缺证红标）+ 操作动态（日报到小时 / 周报按天分组）+ **单证最新状态（每张单证最终态 + 最后动作时间）** + **下一个工作日待办**（日报看次日、含周末提前预警；周报为「下周待办」取下周自然周一~周日窗口；表格含日期/优先级/项目/节点/**单证**五列，单证列为该节点未提交的必填单证）+ 智能摘要 +（周报）与上周对比 + 下周风险（实时读 cargo 当前值判超限）。
+- 操作日志 `op_log`：在新建/位移/撤销/自动完成/提交撤交单证/船位/货物变更等关键动作埋点；**单证类按「同项目·同单证·同日一行最终态」收敛**（提交/撤销覆盖，不堆积）；位移类当日净收敛、撤销单独成条。
 - 编号 `RPT-YYYYMMDD-NNN` 按自然日独立重置；日期可回看任意历史日/周，头部标注「历史回溯数据」。
+
+---
+
+## 数据口径速查
+
+| 表 | 口径 |
+| :-- | :-- |
+| `files` | 每张单证 1 行，`status` = 当前态（`pending`/`submitted`），`submitted_date` = 当前提交日 |
+| `op_log` · 单证类 | **每（项目, 单证, 日期）1 行**：`kind` = 最终动作（提交/撤销），`created_at` = 该次动作时间 |
+| `op_log` · `node_shift` | 每（项目, 节点, 日期）1 行，记当日**净**位移天数（净 0 不记） |
+| `op_log` · `node_unshift` | 撤销单独成条，永不与主动位移对冲归零 |
+| `op_log` · 其余 | 直接追加（`node_done` / `vessel_position` / `cargo_edit` / `project_create`） |
+| `shift_history` | 位移历史（撤销专用），与 `op_log` 不合并 |
+| 时间戳 | **所有入库时间戳统一走 `services/clock.get_now()`**：模拟时间生效时日期跟随模拟日期、时分秒取真实时钟，杜绝「节点按模拟日期判定、日志记真实时间」的错位 |
 
 ---
 
@@ -69,30 +182,51 @@
 ## 运行方法
 
 ```powershell
-py -3.12 app.py        # 首次自动建库并灌入两批演示数据
+py -3.12 app.py        # 首次自动建库并灌入两批演示数据；旧库自动迁移 op_log 口径
 ```
 
-顶栏“测试时间”按钮可切换模拟“今日”，便于演示节点/单证预警与今日定位。
+顶栏“测试时间”按钮可切换模拟“今日”，便于演示节点/单证预警与今日定位。**模拟时间生效后，所有入库时间戳（操作日志、船位、位移历史、报告生成时间）的日期都会跟随模拟日期，时分秒仍取真实时钟**——不会再出现日志记真实时间、节点却按模拟日期判定的错位。
+
+### 测试辅助：清空操作数据
+
+反复测试「操作动态 / 日报周报」时可一键清空日志，**只删 `op_log`，其他表一律不动**（单证勾选状态、节点完成状态、位移历史全部保留）：
+
+```powershell
+py -3.12 tools\reset_ops.py            # 直接清空 op_log（并重置演示日志标记）
+py -3.12 tools\reset_ops.py --list     # 只看现有条数，不删
+py -3.12 tools\reset_ops.py --keep-seed  # 清日志但保留演示标记
+```
+
+> 重置演示标记后，下次启动 `app.py` 会重新灌入演示日志，方便报告「操作动态」不空。
 
 ## 验收 / 自测
 
 ```powershell
-# S1–S7 逻辑验收（位移/守卫/due/撤销/船位等）
-python -X utf8 _opt_test_logic.py
-# UI 冒烟 + 甘特高亮（离屏）
-QT_QPA_PLATFORM=offscreen python -X utf8 _opt_test_ui.py
-# 收纳稳定性 / 海运表头单调 / 单证自动完成
-python -X utf8 _opt_fix_check.py
-# 日报/周报聚合 · 日志收敛/审计/白名单 · 编号按日重置 · 风险实时判定
-python -X utf8 _opt_test_report.py
+# —— 本轮修复/口径回归 ——
+python -X utf8 _repro_toggle.py          # 勾选/取消卡死崩溃（含耗时与 op_log 口径）
+python -X utf8 _verify_filepanel.py      # 单证面板原地刷新不销毁控件 + 滚动保持
+python -X utf8 _mig_check.py             # op_log 旧库迁移（去 valid / 去重 / 幂等）
+python -X utf8 _clock_check.py           # 统一时钟：模拟时间下各表时间戳跟随模拟日期
+python -X utf8 _sim_e2e.py               # 端到端：模拟时间 → 勾选单证 → 日志/单证日期跟随
+python -X utf8 _reset_check.py           # reset_ops 只清 op_log，逐表比对
+python -X utf8 _home_check.py            # 启动页四卡构建（布局告警回归）
+
+# —— 既有验收 ——
+python -X utf8 _opt_test_logic.py        # S1–S7 逻辑验收（位移/守卫/due/撤销/船位等）
+QT_QPA_PLATFORM=offscreen python -X utf8 _opt_test_ui.py   # UI 冒烟 + 甘特高亮（离屏）
+python -X utf8 _opt_fix_check.py         # 右栏状态稳定 / 海运表头单调 / 单证自动完成
+python -X utf8 _opt_test_dash2col.py     # 两栏布局 / 标签切换 / 甘特联动 / 滚轮边界
+python -X utf8 _opt_test_report.py       # 日报周报聚合 · 待办「单证」列 · 编号按日重置 · 风险
+python -X utf8 _opt_test_report_conv.py  # 单证同日收敛 / 跨天保留
+python -X utf8 _report_preview.py        # 用真实库打印报告全文，目检排版
 ```
 
 ## 目录结构（仓库仅代码与 README）
 
 ```
-app.py                      # 入口：初始化 DB + 演示数据 + 启动 GUI
+app.py                      # 入口：初始化 DB + 迁移 + 演示数据 + 启动 GUI
 config.py                   # 国家模板 + 出口港薄壳（内部指向 services/ports）
-db.py                       # SQLite 数据层（项目/节点/单证/货物/班轮/船位/位移历史/op_log）
+db.py                       # SQLite 数据层（项目/节点/单证/货物/班轮/船位/位移历史/op_log + 迁移）
 mock_data.py                # 演示数据（进行中批次）
 mock_completed.py           # 演示数据（已完成历史批次）
 services/
@@ -101,19 +235,20 @@ services/
   scheduler.py              # 排程 + shift_node 推迟/提前（四守卫）+ apply/undo（埋 node_shift/unshift）
   file_checklist.py         # 单证 bootstrap + due 计算
   node_status.py            # 节点状态机 + 必填齐·过期末自动完成（埋 node_done）
-  oplog.py                  # ★ 操作日志统一入口（白名单/审计覆盖/位移当日净收敛）
-  reporting.py              # ★ 报告聚合纯逻辑（概览/未完成/动态/待办/摘要/周对比/风险/blocks）
+  oplog.py                  # ★ 操作日志统一入口（白名单/单证同日收敛/位移当日净收敛）
+  reporting.py              # ★ 报告聚合纯逻辑（概览/未完成/动态/单证最新状态/待办/摘要/周对比/风险）
   report_exporter.py        # ★ docx(可选)/txt 导出 + 按日重置编号 RPT-…-NNN
   reminder.py / clock.py / cargo_check.py / vessel_status.py
 tools/
   gen_ports.py              # 可选：md 一次性导入生成 ports_cn.py；--check 数据自检
+  reset_ops.py              # ★ 测试辅助：清空 op_log（只清操作日志，其他表不动）
 ui/
   main_window.py            # 侧栏 + 顶栏(今日待办/测试时间) + 生成报告页
   map_geo.py                # 地图地理投影工具（轮廓/投影）
   dialogs.py                # 货物台账 / 班轮船位 / 今日待办 对话框（埋点）
   pages/                    # home(四卡) / dashboard / new_project(含港口查询对话框) / completed / report
-  widgets/                  # gantt_grid、file_panel、node_popover(速览卡)、collapsible、
-                            # port_map(地图定位组件)、mini_bar、icons、theme
+  widgets/                  # gantt_grid、file_panel(原地增量刷新)、node_popover(速览卡)、
+                            # port_map(地图定位组件)、scoped_scroll、mini_bar、icons、theme
 ```
 
 > 仓库仅包含代码与 README；业务/设计文档（优化方案、港口查询设计、清关/海港说明、PDF 管理办法等）与运行时数据库仅保存在本地，不入库（见 `.gitignore`）。

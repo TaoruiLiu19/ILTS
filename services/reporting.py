@@ -61,7 +61,7 @@ def week_range(ref_date):
 
 
 def next_week_range(ref_date):
-    """ref_date 的下周自然周 [下周一, 下周日]（周报『未来待办』窗口）"""
+    """ref_date 的下周自然周 [下周一, 下周日]（周报『下周待办』窗口）"""
     monday, _ = week_range(ref_date)
     return monday + timedelta(days=7), monday + timedelta(days=13)
 
@@ -164,10 +164,10 @@ _KIND_LABEL = {
 
 
 def _activity_rows(project_ids, start, end, names):
-    """区间内所有 valid 日志（逐项目聚合后合并，跨项目不混行）。"""
+    """区间内所有日志（逐项目聚合后合并，跨项目不混行）。"""
     rows = []
     for pid in project_ids:
-        for r in db.get_op_log_range(pid, start=start, end=end, valid_only=True):
+        for r in db.get_op_log_range(pid, start=start, end=end):
             rows.append(r)
     rows.sort(key=lambda r: r["created_at"])
     enriched = []
@@ -183,7 +183,67 @@ def _activity_rows(project_ids, start, end, names):
             "date": r["created_at"][:10],
             "hour": r["created_at"][11:13],
         })
-    return enriched
+    return _converge_file_ops(enriched)
+
+
+def _converge_file_ops(items):
+    """
+    单证类收敛：同一 (项目, 单证, 日期) 只保留当天最后一条提交/撤销。
+    数据库本身已按「同项目·同单证·同日一行」落库，这里再做一次防御性收敛，
+    保证报告「操作动态」不会因历史库数据重复而重复展示；**跨天不折叠**。
+    """
+    if not items:
+        return items
+    last = {}
+    for it in items:
+        if it["kind"] in ("file_submit", "file_withdraw"):
+            last[(it["project_id"], it["subject"], it["date"])] = it
+    out = []
+    placed = set()
+    for it in items:
+        if it["kind"] in ("file_submit", "file_withdraw"):
+            key = (it["project_id"], it["subject"], it["date"])
+            if key in placed:
+                continue
+            placed.add(key)
+            out.append(last[key])
+        else:
+            out.append(it)
+    out.sort(key=lambda r: r["created_at"])
+    return out
+
+
+def last_file_states(projects):
+    """每张单证的**最新状态**（跨天取最后一次提交/撤销）。
+
+    数据来源：`files.status/submitted_date`（当前态）+ `op_log` 最后一条单证动作（时间/动作）。
+    返回按项目分组的最新状态行，供报告「单证最新状态」板块。
+    """
+    out = []
+    for p in projects:
+        pid = p["project_id"]
+        pname = p.get("project_name") or pid
+        last = db.last_file_actions(pid)
+        for f in db.get_files(pid):
+            act = last.get(f["doc_name"])
+            submitted = f.get("status") == "submitted"
+            if act:
+                kind_label = "提交" if act["kind"] == "file_submit" else "撤销"
+                at = act["created_at"]
+            else:
+                # 老数据无日志：退回单证自身时间戳
+                kind_label = "提交" if submitted else "—"
+                at = (f.get("submitted_date") or "")[:16] if submitted else ""
+            out.append({
+                "project": pname,
+                "node_id": f.get("node_id"),
+                "doc_name": f["doc_name"],
+                "doc_type": f["doc_type"],
+                "state": "已提交" if submitted else "未提交",
+                "action": kind_label,
+                "at": at,
+            })
+    return out
 
 
 def activity_daily(projects, ref_date, names):
@@ -199,7 +259,7 @@ def activity_weekly(projects, week_start, week_end, names):
                           week_end.strftime("%Y-%m-%d 23:59"), names)
 
 
-# ── 未来待办 ──
+# ── 待办（日报：下一个工作日；周报：下周自然周） ──
 
 def _todo_nodes(projects, wanted_days):
     """wanted_days: [date,...] 期望 plan_start 落在这些天；返回 [ (day, node, project) ]"""
@@ -216,8 +276,42 @@ def _todo_nodes(projects, wanted_days):
     return out
 
 
+def _pending_docs_by_node(projects):
+    """{project_id: {node_id: [未提交的必填单证名, ...]}}（待办表格的「单证」列）"""
+    out = {}
+    for p in projects:
+        pid = p["project_id"]
+        by_node = {}
+        for f in db.get_files(pid):
+            if f.get("doc_type") != "required":
+                continue
+            if f.get("status") == "submitted":
+                continue
+            nid = f.get("node_id")
+            if nid is None:
+                continue
+            by_node.setdefault(nid, []).append(f["doc_name"])
+        out[pid] = by_node
+    return out
+
+
+def _todo_item(day_s, n, p, names, pending, label_fn):
+    """label_fn 接收 date 对象，返回该行的日期展示文案。"""
+    docs = (pending.get(p["project_id"]) or {}).get(n["node_id"]) or []
+    prio = priority_of(n["node_name"])
+    return {
+        "day": day_s, "day_label": label_fn(_parse(day_s)),
+        "project": names.get(p["project_id"], p["project_id"]),
+        "node": f"节点{n['node_id']} {n['node_name']}",
+        "prio": prio,
+        "prio_label": PRIO_LABEL[prio],
+        "docs": "、".join(docs) if docs else "—",
+    }
+
+
 def todo_daily(projects, ref_date):
     names = _project_names([p["project_id"] for p in projects])
+    pending = _pending_docs_by_node(projects)
     tomorrow = ref_date + timedelta(days=1)
     days = [tomorrow]
     warning = None
@@ -225,30 +319,18 @@ def todo_daily(projects, ref_date):
         next_mon = ref_date + timedelta((0 - ref_date.weekday()) % 7 or 7)
         days.append(next_mon)
         warning = ("明日为周末，已并入下周一计划，建议今日提前处理")
-    items = []
-    for day_s, n, p in _todo_nodes(projects, days):
-        items.append({
-            "day": day_s, "day_label": _monthday(_parse(day_s)),
-            "project": names.get(p["project_id"], p["project_id"]),
-            "node": f"节点{n['node_id']} {n['node_name']}",
-            "prio": priority_of(n["node_name"]),
-            "prio_label": PRIO_LABEL[priority_of(n["node_name"])],
-        })
+    items = [_todo_item(day_s, n, p, names, pending, _monthday)
+             for day_s, n, p in _todo_nodes(projects, days)]
     return {"items": items, "warning": warning}
 
 
 def todo_weekly(projects, ref_date):
     names = _project_names([p["project_id"] for p in projects])
+    pending = _pending_docs_by_node(projects)
     ws, we = next_week_range(ref_date)
-    items = []
-    for day_s, n, p in _todo_nodes(projects, [ws + timedelta(days=i) for i in range(7)]):
-        items.append({
-            "day": day_s, "day_label": _parse(day_s).strftime("%m-%d %a"),
-            "project": names.get(p["project_id"], p["project_id"]),
-            "node": f"节点{n['node_id']} {n['node_name']}",
-            "prio": priority_of(n["node_name"]),
-            "prio_label": PRIO_LABEL[priority_of(n["node_name"])],
-        })
+    items = [_todo_item(day_s, n, p, names, pending,
+                        lambda s: _parse(s).strftime("%m-%d %a"))
+             for day_s, n, p in _todo_nodes(projects, [ws + timedelta(days=i) for i in range(7)])]
     return {"items": items, "warning": None}
 
 
@@ -365,7 +447,7 @@ def summary_rules(ov, unfin, risks_items, todo_items, weekly):
     if unfin:
         tail.append(f"需优先处理「{unfin[0]['project']}」")
     if todo_items:
-        tail.append(f"未来待办 {len(todo_items)} 项")
+        tail.append(f"下一个工作日待办 {len(todo_items)} 项")
     tail_s = "；".join(tail) if tail else ""
     return head + tail_s
 
@@ -381,12 +463,11 @@ def _range_text(kind, ref_date, start_s, end_s):
 def build_report(kind, ref_date, project_filter=None, brief=False,
                  report_no=None, generated_at=None):
     """组合完整报告模型。report_no 由导出层传入（预览可传 peek，不占流水）。"""
-    from services.clock import get_today
+    from services.clock import get_today, get_now_str
     ref_date = _parse(ref_date)
     today = get_today()
     if generated_at is None:
-        from datetime import datetime
-        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        generated_at = get_now_str("%Y-%m-%d %H:%M")
 
     name_map = None
     single_project = None
@@ -453,6 +534,7 @@ def build_report(kind, ref_date, project_filter=None, brief=False,
         "activity_daily": act if kind == "daily" else None,
         "activity_weekly": act_rows if kind == "weekly" else None,
         "activity_warning": acts,
+        "file_states": last_file_states(projects),
         "todo": todo,
         "risks": risk_items,
         "weekly_compare": weekly_compare(projects, ref_date) if kind == "weekly" else None,
@@ -464,10 +546,28 @@ def build_report(kind, ref_date, project_filter=None, brief=False,
 # ── 同源排版中间表示（blocks）──
 # 预览 HTML 与 Word/txt 导出都消费此中间表示，保证「所见即所得」。
 
+_CN_NUM = "〇一二三四五六七八九十"
+
+
+def _cn_no(n):
+    """章节序号 → 中文数字（1→一 … 10→十、11→十一）"""
+    if n <= 10:
+        return _CN_NUM[n]
+    if n < 20:
+        return "十" + _CN_NUM[n - 10]
+    return _CN_NUM[n // 10] + "十" + (_CN_NUM[n % 10] if n % 10 else "")
+
+
 def blocks(model):
     """把报告模型转为统一块列表，供 html / docx / txt 三者渲染。"""
     b = []
     m = model
+    _sec = [0]
+
+    def _h(title):
+        """自动递增章节号：条件板块被跳过时不会出现跳号（如无风险时周报不再从六跳到八）"""
+        _sec[0] += 1
+        b.append({"t": "h", "text": f"{_cn_no(_sec[0])}、{title}"})
 
     # 头部
     b.append({"t": "title", "text": m["title"]})
@@ -481,15 +581,13 @@ def blocks(model):
 
     # 总体概览
     ov = m["overview"]
-    b.append({"t": "h", "text": "一、总体概览"})
-    b.append({"t": "para", "text":
-              f"进行中项目 {ov['project_count']} 个"
-              f"（健康状态：绿 {ov['health']['绿']} · 黄 {ov['health']['黄']} · 红 {ov['health']['红']}）"})
+    _h("总体概览")
+    b.append({"t": "para", "text": f"进行中项目 {ov['project_count']} 个"})
     b.append({"t": "para", "text":
               f"节点完成率：{ov['nodes_done']}/{ov['nodes_total']} = {ov['completion_rate']}"})
 
     # 未完成清单
-    b.append({"t": "h", "text": "二、未完成清单"})
+    _h("未完成清单")
     if not m["unfinished"]:
         b.append({"t": "para", "text": "暂无未完成且已到期的节点。"})
     else:
@@ -506,7 +604,7 @@ def blocks(model):
         b.append(unfin_blk)
 
     # 操作动态
-    b.append({"t": "h", "text": "三、操作动态"})
+    _h("操作动态")
     if m["kind"] == "daily":
         items = m["activity_daily"] or []
         if not items:
@@ -539,34 +637,57 @@ def blocks(model):
                                       for x in rr[:3])
                     b.append({"t": "para", "text": f"{kind_label} {len(rr)} 次 · {sample}"})
 
-    # 未来待办
-    b.append({"t": "h", "text": "四、未来待办"})
-    todo = m["todo"]
-    if not todo["items"]:
-        b.append({"t": "para", "text": "未来窗口暂无计划内节点。"})
+    # 单证最新状态（每张单证只反映最后一次提交/撤销）
+    _h("单证最新状态")
+    states = m.get("file_states") or []
+    if not states:
+        b.append({"t": "para", "text": "暂无单证记录。"})
     else:
         b.append({"t": "table",
-                  "header": ["日期", "优先级", "项目", "节点"],
+                  "header": ["项目", "节点", "单证", "类型", "当前状态", "最后动作", "时间"],
                   "rows": [[
-                      it["day_label"], it["prio_label"], it["project"], it["node"],
+                      x["project"],
+                      f"节点{x['node_id']}" if x["node_id"] else "项目级",
+                      x["doc_name"],
+                      "必填" if x["doc_type"] == "required" else "可选",
+                      x["state"],
+                      x["action"],
+                      x["at"] or "—",
+                  ] for x in states],
+                  "red": {i for i, x in enumerate(states)
+                          if x["doc_type"] == "required" and x["state"] != "已提交"}})
+
+    # 待办（日报：下一个工作日；周报：下周自然周）
+    _h("下一个工作日待办" if m["kind"] == "daily" else "下周待办")
+    todo = m["todo"]
+    if not todo["items"]:
+        b.append({"t": "para", "text":
+                  "下一个工作日暂无计划内节点。" if m["kind"] == "daily"
+                  else "下周窗口暂无计划内节点。"})
+    else:
+        b.append({"t": "table",
+                  "header": ["日期", "优先级", "项目", "节点", "单证"],
+                  "rows": [[
+                      it["day_label"], it["prio_label"], it["project"],
+                      it["node"], it.get("docs") or "—",
                   ] for it in todo["items"]],
                   "red": set()})
     if todo["warning"]:
         b.append({"t": "note", "text": todo["warning"]})
 
     # 摘要
-    b.append({"t": "h", "text": "五、本期摘要"})
+    _h("本期摘要")
     b.append({"t": "para", "text": m["summary"]})
 
     # 风险
     if m["risks"]:
-        b.append({"t": "h", "text": "六、风险提示"})
+        _h("风险提示")
         for r in m["risks"]:
             b.append({"t": "para", "text": "· " + r})
 
     # 周对比
     if m["kind"] == "weekly":
-        b.append({"t": "h", "text": "七、与上周对比"})
+        _h("与上周对比")
         wc = m["weekly_compare"]
         if wc is None:
             b.append({"t": "note", "text": "前一周无数据，本次为首份周报。"})

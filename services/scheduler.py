@@ -10,7 +10,7 @@
   · 四守卫：① 提前不早于今日；② Done 节点保护；③ 链连续性（锚点不漂移）；④ delay_days 净位移可负 + shift_history 留痕可撤销。
 """
 
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta
 
 AREA_ORDER = ("DOME", "SEA", "OVERSEA")
 
@@ -237,7 +237,8 @@ def apply_shift(project_id, from_node_id, days, oplog=True):
                        is_delayed=n.get("is_delayed", 0))
     db.update_project(project_id, etd=new_etd, eta=new_eta)
 
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")  # 微秒级：保证同组/同秒可区分
+    from services.clock import get_now_str
+    created_at = get_now_str("%Y-%m-%d %H:%M:%S.%f")  # 微秒级：保证同组/同秒可区分
     db.insert_shift_history(project_id, affected, int(days), created_at)
 
     # 操作日志埋点（node_shift 主动调整）

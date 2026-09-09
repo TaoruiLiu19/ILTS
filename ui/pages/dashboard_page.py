@@ -8,7 +8,7 @@ from services.clock import get_today
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QScrollArea, QSpinBox, QMessageBox
+    QFrame, QScrollArea, QSpinBox, QMessageBox, QTabBar, QSizePolicy
 )
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QCursor
@@ -31,9 +31,9 @@ from ui.icons import icon, pixmap
 from ui.widgets.mini_bar import MiniBar
 from ui.widgets.gantt_grid import GanttGrid
 from ui.widgets.file_panel import FilePanel
+from ui.widgets.scoped_scroll import ScopedScrollArea
 from ui.widgets.node_popover import NodePopover
 from ui.dialogs import CargoDialog, VesselDialog
-from ui.widgets.collapsible import CollapsibleSection
 
 
 def _oplog(*args, **kw):
@@ -135,19 +135,17 @@ class ProjectCard(QFrame):
         self._step_spin = None
         self._op_note = None
         self._flash_note = ""       # 跨重建保留的操作提示
-        # 可收纳区块的展开状态（跨重建记忆；甘特恒显不在此列）
-        self._panel_states = {"shift": bool(_st.get("shift", False)),
-                              "files": bool(_st.get("files", False))}
+        # 右侧面板当前活动标签（跨重建记忆；甘特恒显不在此列）
+        self._tab = "shift" if _st.get("active_tab") == "shift" else "files"
+        self._right_collapsed = bool(_st.get("right", False))   # 右栏可收纳
         # 甘特 ↔ 单证清单 联动状态
         self._focused_node = None      # 点击钉住的节点（跨重建保留）
         self._pop = None               # 节点速览悬浮卡（懒创建）
         self._gantt_grid = None
-        self._file_sec = None
-        self._shift_sec = None
         self._file_panel = None
         self._load()
         self.setObjectName("card")
-        card_shadow(self, blur=18, dy=4, alpha=18)
+        self._apply_card_shadow()
         self._build()
 
     # ── 数据 ──
@@ -361,16 +359,27 @@ class ProjectCard(QFrame):
         if self._on_state:
             self._on_state("expanded", self._expanded)
 
+    def _apply_card_shadow(self):
+        """收起态浮起阴影（开销低）；展开后卡片很高，阴影会拖慢整卡重绘"""
+        self._card_shadow = card_shadow(self, blur=18, dy=4, alpha=18)
+
+    def _clear_card_shadow(self):
+        self._card_shadow = None
+        self.setGraphicsEffect(None)
+
     def _apply_expanded(self):
         if self._expanded:
             self.expand_btn.setText("收起")
             self.expand_btn.setIcon(icon("chevron_up", ACCENT, 14))
+            self._clear_card_shadow()      # 性能：展开后去掉高开销阴影
             self._build_expanded()
             self.expand_area.setVisible(True)
         else:
             self.expand_btn.setText("展开")
             self.expand_btn.setIcon(icon("chevron_down", ACCENT, 14))
+            # 收起前先隐藏展开区 → 阴影作用于矮卡片，避免整幅展开高卡做 18px 模糊(性能)
             self.expand_area.setVisible(False)
+            self._apply_card_shadow()
 
     def _clear_layout(self, layout):
         while layout.count():
@@ -389,52 +398,147 @@ class ProjectCard(QFrame):
         active = sum(1 for s in statuses.values() if s == "Active")
         fc = count_files(self._files)
 
-        # 统计字牌
+        # 统计字牌（整行置顶），记录数值标签供轻量刷新
+        self._chip = {}
+        cargo_cap = f"货物 {self._cargo_count} / 超限 {self._cargo_over}"
+        cargo_val = "⚠" if self._cargo_over else "✓"
+        cargo_col = RED if self._cargo_over else GREEN
+        cargo_bg = "#FDEBEA" if self._cargo_over else "#E8F8EC"
         stat_row = QHBoxLayout()
         stat_row.setSpacing(10)
-        stat_row.addWidget(self._stat_chip("进行中", active, ACCENT, ACCENT_SOFT))
-        stat_row.addWidget(self._stat_chip("逾期", overdue, RED, "#FDEBEA"))
-        stat_row.addWidget(self._stat_chip("缺单证", fc["pending"], ORANGE, "#FFF3E4"))
-        stat_row.addWidget(self._stat_chip(
-            f"货物 {self._cargo_count} / 超限 {self._cargo_over}",
-            "⚠" if self._cargo_over else "✓",
-            RED if self._cargo_over else GREEN,
-            "#FDEBEA" if self._cargo_over else "#E8F8EC"))
+        stat_row.addWidget(self._stat_chip("active", "进行中", active, ACCENT, ACCENT_SOFT))
+        stat_row.addWidget(self._stat_chip("overdue", "逾期", overdue, RED, "#FDEBEA"))
+        stat_row.addWidget(self._stat_chip("missing", "缺单证", fc["pending"], ORANGE, "#FFF3E4"))
+        stat_row.addWidget(self._stat_chip("cargo", cargo_cap, cargo_val, cargo_col, cargo_bg))
         stat_row.addStretch()
         layout.addLayout(stat_row)
 
-        # ── 时间轴 · 甘特（瓶颈/风险/吊装预警 高亮） ──
+        # 两栏：左 = 时间轴·甘特（完整显示，无内滚）｜右 = 可收纳切换面板
+        cols = QHBoxLayout()
+        cols.setSpacing(18)
+        cols.addWidget(self._build_left_col(), stretch=1)
+        cols.addWidget(self._build_right_col(), stretch=0)
+        layout.addLayout(cols, stretch=1)
+
+    def _build_left_col(self):
+        """左栏：时间轴甘特，整幅显示、无上下滚动条"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
         gantt_label = QLabel("时间轴")
         gantt_label.setObjectName("section")
-        layout.addWidget(gantt_label)
+        v.addWidget(gantt_label)
 
         gantt = GanttGrid(
             self._nodes, self._today,
             export_port=self._project.get("export_port"),
             over_count=self._cargo_over,
             buffer_days=self._project.get("buffer_days", 4))
-        gantt.setFixedHeight(gantt.auto_height())
-        # 甘特 ↔ 单证清单 联动：悬停速览 / 点击聚焦
+        gantt.setFixedHeight(gantt.auto_height())   # 完整高度，不出现上下滚动条
+        gantt.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        gantt.setMinimumWidth(340)   # 避免宽画布把整页撑出横向滚动条（甘特内部横向滚动即可）
         gantt.nodeHovered.connect(self._on_gantt_hover)
         gantt.nodeActivated.connect(self._on_gantt_activate)
         self._gantt_grid = gantt
-        layout.addWidget(gantt)
+        v.addWidget(gantt)
+        return w
 
-        # ── 动态调整 · 推迟/提前（优化方案 D2，可收纳，默认收起） ──
-        shift_sec = CollapsibleSection(
-            "动态调整 · 推迟 / 提前",
-            collapsed=not self._panel_states.get("shift", False))
-        shift_sec.expanded_changed.connect(
-            lambda v, k="shift": self._on_panel_state(k, v))
-        layout.addWidget(shift_sec)
-        self._shift_sec = shift_sec
+    def _build_right_col(self):
+        """右栏：可收纳面板（标签 + 面板 + 动作行）；收纳开关融入标签行右端"""
+        panel = QWidget()
+        self._right_panel = panel
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+
+        # 头部：切换标签 + 收纳开关（融入标签栏背景，弱化不突兀）
+        self._tabbar = QTabBar()
+        self._tabbar.addTab("动态调整 · 推迟/提前")
+        self._tabbar.addTab("单证清单")
+        self._tabbar.setDocumentMode(True)
+        self._tabbar.currentChanged.connect(self._on_tab_changed)
+        self._head_bar = QWidget()
+        self._head_bar.setStyleSheet(f"background: #FAFAFC; border-radius: 8px;")
+        hb = QHBoxLayout(self._head_bar)
+        hb.setContentsMargins(4, 4, 4, 4)
+        hb.setSpacing(4)
+        hb.addWidget(self._tabbar, 1)
+        self._collapse_btn = QPushButton()
+        self._collapse_btn.setCursor(Qt.PointingHandCursor)
+        self._collapse_btn.setFixedSize(28, 28)
+        self._collapse_btn.setIcon(icon("chevron_right", TEXT_TERTIARY, 14))
+        self._collapse_btn.setIconSize(QSize(14, 14))
+        self._collapse_btn.setToolTip("收起面板")
+        self._collapse_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 6px; }"
+            "QPushButton:hover { background: #E5E5EA; }"
+        )
+        self._collapse_btn.clicked.connect(self._toggle_right)
+        hb.addWidget(self._collapse_btn, 0, Qt.AlignVCenter)
+        v.addWidget(self._head_bar)
+
+        # 当前面板宿主
+        self._panel_host = QWidget()
+        self._panel_host_layer = QVBoxLayout(self._panel_host)
+        self._panel_host_layer.setContentsMargins(0, 0, 0, 0)
+        self._panel_host_layer.setSpacing(0)
+        v.addWidget(self._panel_host, stretch=1)
+
+        # 动作行（随面板收纳）
+        self._action_row_area = QWidget()
+        ar = QVBoxLayout(self._action_row_area)
+        ar.setContentsMargins(0, 0, 0, 0)
+        ar.setSpacing(0)
+        ar.addLayout(self._build_action_row())
+        v.addWidget(self._action_row_area)
+
+        # 收起态重开按钮条（仅收起时可见，垂直居中）
+        self._reopen_bar = QWidget()
+        rb = QVBoxLayout(self._reopen_bar)
+        rb.setContentsMargins(0, 0, 0, 0)
+        rb.addStretch()
+        self._reopen_btn = QPushButton()
+        self._reopen_btn.setCursor(Qt.PointingHandCursor)
+        self._reopen_btn.setFixedSize(32, 32)
+        self._reopen_btn.setIcon(icon("chevron_right", ACCENT, 15))
+        self._reopen_btn.setIconSize(QSize(15, 15))
+        self._reopen_btn.setToolTip("展开面板")
+        self._reopen_btn.setStyleSheet(
+            "QPushButton { background: #FFFFFF; border: 1px solid #E5E5EA;"
+            " border-radius: 16px; }"
+            "QPushButton:hover { border-color: #D1D1D6; background: #F5F5F7; }")
+        self._reopen_btn.clicked.connect(self._toggle_right)
+        rb.addWidget(self._reopen_btn, 0, Qt.AlignHCenter)
+        rb.addStretch()
+        v.addWidget(self._reopen_bar)
+
+        # 预构建两个页面（跨标签切换复用，不丢滚动/焦点）
+        self._shift_page = self._build_shift_page()
+        self._files_page = self._build_files_page()
+        self._set_active_panel(self._tab)
+
+        # 重建后恢复点击钉住的节点（仅在单证标签激活时定位，不反向切换）
+        if self._focused_node is not None and self._tab == "files":
+            self._file_panel.focus_node(self._focused_node)
+            self._file_panel.scroll_to_node(self._focused_node)
+
+        self._apply_right_collapsed()
+        return panel
+
+    def _build_shift_page(self):
+        page = QWidget()
+        page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
 
         tip = QLabel(
             "选中节点 → 点击「提前 − / 推迟 +」按步长整体位移：境内 1–4 联动 ETD 与海运；"
             "海运 5 联动 ETA 与境外全段；境外 6–12 口岸整段平移。已完成节点不可位移。")
         tip.setWordWrap(True)
         tip.setStyleSheet(f"font-size: 11px; color: {TEXT_TERTIARY};")
-        shift_sec.add_widget(tip)
+        lay.addWidget(tip)
 
         ctl_row = QHBoxLayout()
         ctl_row.addWidget(QLabel("步长"))
@@ -449,12 +553,13 @@ class ProjectCard(QFrame):
         note_hint = QLabel("位移后单证建议提交日自动重算")
         note_hint.setStyleSheet(f"font-size: 11px; color: {TEXT_TERTIARY};")
         ctl_row.addWidget(note_hint)
-        shift_sec.add_layout(ctl_row)
+        lay.addLayout(ctl_row)
 
-        shift_scroll = QScrollArea()
+        shift_scroll = ScopedScrollArea()
         shift_scroll.setWidgetResizable(True)
-        shift_scroll.setFixedHeight(214)
-        shift_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        shift_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        shift_scroll.setStyleSheet(
+            "ScopedScrollArea, QScrollArea { border: none; background: transparent; }")
         body = QWidget()
         blay = QVBoxLayout(body)
         blay.setContentsMargins(0, 0, 0, 0)
@@ -464,16 +569,67 @@ class ProjectCard(QFrame):
             blay.insertWidget(blay.count() - 1, ShiftRow(
                 n, self._today, self._shift_node))
         shift_scroll.setWidget(body)
-        shift_sec.add_widget(shift_scroll)
+        lay.addWidget(shift_scroll, stretch=1)
 
         self._op_note = QLabel("")
         self._op_note.setWordWrap(True)
         self._op_note.setStyleSheet(f"font-size: 11px; color: {ACCENT};")
         if self._flash_note:
             self._op_note.setText(self._flash_note)
-        shift_sec.add_widget(self._op_note)
+        lay.addWidget(self._op_note)
+        return page
 
-        # ── 台账 / 班轮动作 + 撤销 ──
+    def _build_files_page(self):
+        page = QWidget()
+        page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        file_panel = FilePanel(self._files, self._nodes, self._today)
+        file_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        file_panel.file_toggled.connect(lambda fid, checked: self._toggle_file(fid, checked))
+        lay.addWidget(file_panel, 1)
+        self._file_panel = file_panel
+        return page
+
+    def _set_active_panel(self, tab, sync_tabbar=True):
+        """切换右侧活动面板，仅替换宿主内容，不重建整卡（保留甘特/滚动）"""
+        self._tab = tab
+        if sync_tabbar and getattr(self, "_tabbar", None) is not None:
+            b = self._tabbar.blockSignals(True)
+            self._tabbar.setCurrentIndex(0 if tab == "shift" else 1)
+            self._tabbar.blockSignals(b)
+        while self._panel_host_layer.count():
+            item = self._panel_host_layer.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        page = self._shift_page if tab == "shift" else self._files_page
+        self._panel_host_layer.addWidget(page)
+        if self._on_state:
+            self._on_state("active_tab", tab)
+
+    def _on_tab_changed(self, index):
+        tab = "shift" if index == 0 else "files"
+        if tab == self._tab:
+            return
+        self._set_active_panel(tab, sync_tabbar=False)
+
+    def _toggle_right(self):
+        self._right_collapsed = not self._right_collapsed
+        self._apply_right_collapsed()
+        if self._on_state:
+            self._on_state("right", self._right_collapsed)
+
+    def _apply_right_collapsed(self):
+        """收起/展开右栏：收起时仅留一条居中展开按钮，甘特随之占满全宽"""
+        c = self._right_collapsed
+        self._head_bar.setVisible(not c)
+        self._panel_host.setVisible(not c)
+        self._action_row_area.setVisible(not c)
+        self._reopen_bar.setVisible(c)
+        self._right_panel.setFixedWidth(48 if c else 540)
+
+    def _build_action_row(self):
         act_row = QHBoxLayout()
         act_row.setSpacing(8)
 
@@ -501,29 +657,9 @@ class ProjectCard(QFrame):
         undo_btn.setEnabled(has_hist)
         undo_btn.clicked.connect(self._undo_shift)
         act_row.addWidget(undo_btn)
-        layout.addLayout(act_row)
+        return act_row
 
-        # ── 单证清单（可收纳，默认收起） ──
-        file_sec = CollapsibleSection(
-            "单证清单",
-            collapsed=not self._panel_states.get("files", False))
-        file_sec.expanded_changed.connect(
-            lambda v, k="files": self._on_panel_state(k, v))
-        layout.addWidget(file_sec)
-
-        file_panel = FilePanel(self._files, self._nodes, self._today)
-        file_panel.setFixedHeight(360)
-        file_panel.file_toggled.connect(lambda fid, checked: self._toggle_file(fid, checked))
-        file_sec.add_widget(file_panel)
-        self._file_sec = file_sec
-        self._file_panel = file_panel
-
-        # 重建后恢复点击钉住的节点（仅在单证清单展开时高亮/滚动，不反向强制展开）
-        if self._focused_node is not None and file_sec.is_expanded():
-            file_panel.focus_node(self._focused_node)
-            file_panel.scroll_to_node(self._focused_node)
-
-    def _stat_chip(self, caption, value, color, bg):
+    def _stat_chip(self, key, caption, value, color, bg):
         box = QFrame()
         box.setFixedHeight(36)
         box.setStyleSheet(f"background: {bg}; border-radius: 10px;")
@@ -536,7 +672,21 @@ class ProjectCard(QFrame):
         val = QLabel(str(value))
         val.setStyleSheet(f"font-size: 16px; font-weight: 600; color: {color};")
         h.addWidget(val)
+        self._chip[key] = val
         return box
+
+    def _update_chips(self):
+        """单证勾选等轻量变更后仅刷新统计字牌数值，不重建甘特"""
+        if not getattr(self, "_chip", None):
+            return
+        statuses = compute_all_status(self._nodes, self._today)
+        self._chip["active"].setText(str(sum(1 for s in statuses.values() if s == "Active")))
+        self._chip["overdue"].setText(str(sum(1 for s in statuses.values() if s == "Overdue")))
+        fc = count_files(self._files)
+        self._chip["missing"].setText(str(fc["pending"]))
+        color = RED if self._cargo_over else GREEN
+        self._chip["cargo"].setText("⚠" if self._cargo_over else "✓")
+        self._chip["cargo"].setStyleSheet(f"font-size: 16px; font-weight: 600; color: {color};")
 
     # ── 甘特 ↔ 单证清单 联动 ──
 
@@ -549,7 +699,7 @@ class ProjectCard(QFrame):
         return [f for f in self._files if f.get("node_id") == nid]
 
     def _on_gantt_hover(self, node):
-        """悬停：弹速览卡；文件区展开时同步高亮对应分组（收起时不强行展开）"""
+        """悬停：弹速览卡；单证标签激活时同步高亮对应分组（收起时不强行切换）"""
         pop = self._ensure_popover()
         if node is None:
             pop.hide_card()
@@ -557,26 +707,24 @@ class ProjectCard(QFrame):
                 self._file_panel.clear_focus()
             return
         pop.show_node(node, self._node_files(node["node_id"]), QCursor.pos())
-        if (self._file_panel is not None and self._file_sec is not None
-                and self._file_sec.is_expanded()):
+        if self._file_panel is not None and self._tab == "files":
             self._file_panel.focus_node(node["node_id"])
 
     def _on_gantt_activate(self, node):
-        """单击：展开文件区并钉住该节点分组；再次点击同一节点取消钉住"""
+        """单击：切到单证标签并钉住该节点分组；再次点击同一节点取消钉住"""
         nid = node["node_id"]
         pop = self._ensure_popover()
-        if self._focused_node == nid and self._file_sec is not None:
-            # 再次点击同节点 → 取消钉住并收起文件区
+        if self._focused_node == nid:
+            # 再次点击同节点 → 取消钉住
             self._focused_node = None
             if self._file_panel is not None:
                 self._file_panel.clear_focus()
-            self._file_sec.set_expanded(False)
             pop.hide_card()
             return
         self._focused_node = nid
         pop.show_node(node, self._node_files(nid), QCursor.pos())
-        if self._file_sec is not None and not self._file_sec.is_expanded():
-            self._file_sec.set_expanded(True)
+        if self._tab != "files":
+            self._set_active_panel("files")
         if self._file_panel is not None:
             self._file_panel.focus_node(nid)
             self._file_panel.scroll_to_node(nid)
@@ -617,13 +765,13 @@ class ProjectCard(QFrame):
             self._after_change()
 
     def _toggle_file(self, file_id, checked):
-        from db import today_str
+        """勾选/取消单证 → 落库 + 原地刷新行（绝不重建面板，避免销毁信号发射者）"""
         finfo = db.get_files(self._project["project_id"]) or []
         doc = next((f for f in finfo if f["file_id"] == file_id), {})
         doc_name = doc.get("doc_name", "")
         node_id = doc.get("node_id")
         if checked:
-            db.update_file(file_id, status="submitted", submitted_date=today_str())
+            db.update_file(file_id, status="submitted", submitted_date=db.today_str())
             _oplog("file_submit", self._project["project_id"], node_id=node_id,
                    subject=doc_name, detail="提交")
         else:
@@ -634,15 +782,13 @@ class ProjectCard(QFrame):
         sync_doc_completion(self._project["project_id"])
         self._load()
         self._update_header()
-        if self._expanded:
-            # 内容变更不改变「动态调整 / 单证清单」的打开/关闭状态
-            self._build_expanded()
-
-    def _on_panel_state(self, key, value):
-        """收纳区块收起/展开时：记录到本地，并上报上级供跨重建记忆"""
-        self._panel_states[key] = value
-        if self._on_state:
-            self._on_state(key, value)
+        self._update_chips()          # 仅刷新统计字牌
+        if self._file_panel is not None:
+            # ★ 原地增量刷新：只改这一行（及其节点状态），不销毁任何控件
+            self._file_panel.update_files(self._files, self._nodes)
+            if self._focused_node is not None:
+                self._file_panel.focus_node(self._focused_node)
+        self._flash_note = f"✓ {'提交' if checked else '撤交'} {doc_name}"
 
 
 class DashboardPage(QWidget):
@@ -657,7 +803,7 @@ class DashboardPage(QWidget):
 
     def _get_card_state(self, pid):
         return self._card_state.setdefault(
-            pid, {"expanded": False, "shift": False, "files": False})
+            pid, {"expanded": False, "active_tab": "files", "right": False})
 
     def _on_card_state(self, pid, key, value):
         """卡片主动上报折叠状态变化 → 存入本页面缓存，供重建时恢复"""

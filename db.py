@@ -143,7 +143,9 @@ CREATE TABLE IF NOT EXISTS shift_history (
 );
 CREATE INDEX IF NOT EXISTS idx_sh_project ON shift_history(project_id, id);
 
--- 日报/周报 · 操作日志（报告时间线 + 审计留痕）
+-- 日报/周报 · 操作日志（报告时间线）
+-- 单证类（file_submit / file_withdraw）收敛口径：同一项目·同一单证·同一天**只留一行最终态**
+-- （kind 即「提交 / 撤销」，created_at 即该次动作时间）；反复勾选/取消不会堆积行。
 CREATE TABLE IF NOT EXISTS op_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id  TEXT NOT NULL,
@@ -151,16 +153,48 @@ CREATE TABLE IF NOT EXISTS op_log (
     kind        TEXT NOT NULL,
     subject     TEXT NOT NULL DEFAULT '',
     detail      TEXT,
-    valid       INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_opl_project ON op_log(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_opl_subject ON op_log(project_id, kind, subject, created_at);
 """
 
 
 def init_db():
     conn = get_conn()
     conn.executescript(SCHEMA_SQL)
+    _migrate_op_log(conn)
+    conn.commit()
+
+
+def _migrate_op_log(conn):
+    """旧库迁移到「每单证每天只留一行最终态」口径。
+
+    旧实现有两处遗留：
+      ① op_log 用 valid 标记审计底稿（被覆盖行 valid=0）；
+      ② 撤交时只回收 file_submit 行，导致同一天可能残留多条 file_withdraw。
+    迁移步骤（幂等）：
+      ① 删除 valid=0 的被覆盖行；
+      ② 丢弃 valid 列（SQLite 3.35+ DROP COLUMN，否则退化为恒置 1）；
+      ③ 按 (project_id, subject, 日期) 去重，仅保留 id 最大（即最后动作）的一行；
+      ④ 新增 subject 索引。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(op_log)").fetchall()}
+    if "valid" in cols:
+        conn.execute("DELETE FROM op_log WHERE valid=0")
+        try:
+            conn.execute("ALTER TABLE op_log DROP COLUMN valid")
+        except sqlite3.OperationalError:
+            # 老版本 SQLite 不支持 DROP COLUMN → 把 valid 恒置 1（列在但无意义）
+            conn.execute("UPDATE op_log SET valid=1")
+
+    # 去重：同项目·同单证·同日只保留最后一条（file_submit / file_withdraw 合并看）
+    conn.execute(
+        "DELETE FROM op_log WHERE kind IN ('file_submit','file_withdraw') AND id NOT IN ("
+        "  SELECT MAX(id) FROM op_log WHERE kind IN ('file_submit','file_withdraw')"
+        "  GROUP BY project_id, subject, substr(created_at, 1, 10))")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_opl_subject ON op_log(project_id, kind, subject, created_at)")
     conn.commit()
 
 
@@ -327,13 +361,12 @@ def get_vessel(project_id):
 # ── Vessel positions ──
 
 def insert_vessel_position(project_id, lat=None, lon=None, actual_eta=None, note=None):
-    from datetime import datetime
+    from services.clock import get_now_str
     conn = get_conn()
     conn.execute(
         "INSERT INTO vessel_positions (project_id, lat, lon, actual_eta, note, created_at) "
         "VALUES (?,?,?,?,?,?)",
-        (project_id, lat, lon, actual_eta, note,
-         datetime.now().strftime("%Y-%m-%d %H:%M")))
+        (project_id, lat, lon, actual_eta, note, get_now_str("%Y-%m-%d %H:%M")))
     conn.commit()
 
 
@@ -428,25 +461,25 @@ def update_file(file_id, **kw):
     conn.commit()
 
 
-# ── Op log（操作日志 · 报告时间线/审计） ──
+# ── Op log（操作日志 · 报告时间线） ──
 
 def insert_op_log(project_id, kind, subject="", detail=None, node_id=None,
-                   valid=1, created_at=None):
-    """写入一条操作日志。created_at 缺省取真实当下（分钟级）。"""
+                  created_at=None):
+    """写入一条操作日志。created_at 缺省取统一时钟（模拟时间优先，分钟级）。"""
     if created_at is None:
-        from datetime import datetime
-        created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        from services.clock import get_now_str
+        created_at = get_now_str("%Y-%m-%d %H:%M")
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO op_log (project_id, node_id, kind, subject, detail, valid, created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (project_id, node_id, kind, subject, detail, int(valid), created_at))
+        "INSERT INTO op_log (project_id, node_id, kind, subject, detail, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (project_id, node_id, kind, subject, detail, created_at))
     conn.commit()
     return cur.lastrowid
 
 
-def get_op_log_range(project_id, start=None, end=None, valid_only=True, limit=1000):
-    """按 project_id + 时间区间（双条件，含边界）过滤；默认仅有效行。"""
+def get_op_log_range(project_id, start=None, end=None, limit=1000):
+    """按 project_id + 时间区间（双条件，含边界）过滤。"""
     conn = get_conn()
     sql = "SELECT * FROM op_log WHERE project_id=?"
     args = [project_id]
@@ -456,8 +489,6 @@ def get_op_log_range(project_id, start=None, end=None, valid_only=True, limit=10
     if end:
         sql += " AND created_at <= ?"
         args.append(end)
-    if valid_only:
-        sql += " AND valid=1"
     sql += " ORDER BY id ASC"
     if limit:
         sql += " LIMIT ?"
@@ -466,7 +497,7 @@ def get_op_log_range(project_id, start=None, end=None, valid_only=True, limit=10
     return [dict(r) for r in rows]
 
 
-def get_op_log_all(start=None, end=None, valid_only=True, limit=2000):
+def get_op_log_all(start=None, end=None, limit=2000):
     """全项目操作日志（跨项目不混行：仍以 start/end 过滤，供报告聚合各项目后合并）。"""
     conn = get_conn()
     sql = "SELECT * FROM op_log WHERE 1=1"
@@ -477,8 +508,6 @@ def get_op_log_all(start=None, end=None, valid_only=True, limit=2000):
     if end:
         sql += " AND created_at <= ?"
         args.append(end)
-    if valid_only:
-        sql += " AND valid=1"
     sql += " ORDER BY id ASC"
     if limit:
         sql += " LIMIT ?"
@@ -487,23 +516,47 @@ def get_op_log_all(start=None, end=None, valid_only=True, limit=2000):
     return [dict(r) for r in rows]
 
 
-def invalidate_op_log(cond_kwargs):
-    """把满足 {kind, subject, project_id, created_date?} 的有效行置 0（审计保留）。
-    用于『写前收敛』：提交覆盖、位移当日净收敛等。"""
+def delete_op_log(cond):
+    """删除满足 {project_id?, kind?, subject?, node_id?, created_day?} 的行。
+
+    kind 支持 str 或 tuple/set（多类一起收敛）；created_day='YYYY-MM-DD' 按当日前缀匹配。
+    用于「同一主体同日只留最终态」的写前收敛。
+    """
     conn = get_conn()
-    if "created_day" in cond_kwargs and cond_kwargs["created_day"]:
-        # 按当日（created_at LIKE 'YYYY-MM-DD%'）收敛
-        day = cond_kwargs.pop("created_day")
-        cond_kwargs["created_at_like"] = day + "%"
-    if "created_at_like" in cond_kwargs and cond_kwargs["created_at_like"]:
-        like = cond_kwargs.pop("created_at_like")
-        sql = "UPDATE op_log SET valid=0 WHERE valid=1 AND created_at LIKE ?"
-        args = [like]
-        for k, v in cond_kwargs.items():
+    cond = dict(cond)
+    sql = "DELETE FROM op_log WHERE 1=1"
+    args = []
+    day = cond.pop("created_day", None)
+    if day:
+        sql += " AND created_at LIKE ?"
+        args.append(day + "%")
+    for k, v in cond.items():
+        if isinstance(v, (tuple, list, set)):
+            v = list(v)
+            if not v:
+                continue
+            sql += f" AND {k} IN ({','.join('?' * len(v))})"
+            args.extend(v)
+        else:
             sql += f" AND {k}=?"
             args.append(v)
-        conn.execute(sql, args)
-        conn.commit()
+    cur = conn.execute(sql, args)
+    conn.commit()
+    return cur.rowcount
+
+
+def last_file_actions(project_id):
+    """返回 {doc_name: op_log行} —— 每张单证**最后一次**提交/撤销记录（跨天取最新）。"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM op_log WHERE project_id=? AND kind IN ('file_submit','file_withdraw') "
+        "ORDER BY created_at DESC, id DESC", (project_id,)).fetchall()
+    out = {}
+    for r in rows:
+        key = r["subject"] or ""
+        if key not in out:
+            out[key] = dict(r)
+    return out
 
 
 # ── Settings ──

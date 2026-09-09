@@ -1,7 +1,7 @@
 """
 报告功能验收自测（纯逻辑，离屏）
-覆盖：op_log 埋点/白名单、文件审计覆盖、位移当日净收敛、撤销分离、
-日报/周报聚合、周对比空数据降级、编号按日重置、风险实时判定。
+覆盖：op_log 埋点/白名单、单证同日收敛为一行最终态、位移当日净收敛、撤销分离、
+日报/周报聚合、单证最新状态板块、周对比空数据降级、编号按日重置、风险实时判定。
 
 运行：python -X utf8 _opt_test_report.py
 """
@@ -67,7 +67,7 @@ oplog("whatever", PID)
 check(len(db.get_op_log_all()) == before, "未知 kind 不产生日志（T16）")
 
 
-print("== 2. 文件审计覆盖（T14） ==")
+print("== 2. 单证同日收敛为一行最终态（T14） ==")
 doc = "商业发票"
 oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
       created_at="2026-09-09 10:00")
@@ -75,15 +75,25 @@ oplog("file_withdraw", PID, node_id=1, subject=doc, detail="撤交",
       created_at="2026-09-09 11:00")
 oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
       created_at="2026-09-09 15:00")
-valid = db.get_op_log_range(PID, start="2026-09-09 00:00", end="2026-09-09 23:59")
-submits = [r for r in valid if r["kind"] == "file_submit"]
-f_with = [r for r in db.get_op_log_all(valid_only=False)
-          if r["kind"] in ("file_submit", "file_withdraw")]
-check(len(submits) == 1 and sum(bool(r["valid"]) for r in submits) == 1,
-      "同日同单证仅保留最新有效提交（1 行）")
-check(sum(1 for r in f_with) >= 3, "审计底稿保留 3 行（含撤交/被覆盖）")
-withdrawn = any(r["kind"] == "file_withdraw" and r["valid"] for r in f_with)
-check(submits[0]["created_at"].startswith("2026-09-09 15"), "最终动态显示 15 时提交")
+rows = db.get_op_log_range(PID, start="2026-09-09 00:00", end="2026-09-09 23:59")
+mine = [r for r in rows if r["subject"] == doc]
+check(len(mine) == 1, "同日同单证只留 1 行（提交/撤交不并存）")
+check(mine[0]["kind"] == "file_submit", "最终态 = 提交（最后动作）")
+check(mine[0]["created_at"] == "2026-09-09 15:00", "时间戳 = 最后一次动作时间")
+# 再撤交 → 仍是 1 行，但 kind 变为撤交
+oplog("file_withdraw", PID, node_id=1, subject=doc, detail="撤交",
+      created_at="2026-09-09 16:00")
+mine = [r for r in db.get_op_log_range(PID) if r["subject"] == doc]
+check(len(mine) == 1 and mine[0]["kind"] == "file_withdraw"
+      and mine[0]["created_at"] == "2026-09-09 16:00",
+      "再撤交 → 仍 1 行，覆盖为「撤销 + 16:00」")
+# 跨天保留：次日再提交 → 多一行
+oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
+      created_at="2026-09-10 09:00")
+mine = [r for r in db.get_op_log_range(PID) if r["subject"] == doc]
+check(len(mine) == 2, "跨天各留一行（9/9 撤销 + 9/10 提交）")
+last = db.last_file_actions(PID).get(doc)
+check(last and last["created_at"] == "2026-09-10 09:00", "last_file_actions 取全局最后一次")
 
 
 print("== 3. 位移当日净收敛 + 撤销分离（T15） ==")
@@ -105,6 +115,15 @@ print("== 4. build_report 日报 / 周报 ==")
 m = reporting.build_report("daily", "2026-09-09")
 check(m["kind"] == "daily" and m["overview"]["project_count"] >= 1, "日报概览 (T1 顶部)")
 check("oper" not in m["title"], "标题不含非法前缀")
+# 单证最新状态板块：每张单证一行，且反映最终态
+states = m["file_states"]
+check(len(states) == len(db.get_files(PID)), "单证最新状态覆盖全部单证")
+blk = reporting.blocks(m)
+check(any(b["t"] == "h" and "单证最新状态" in b["text"] for b in blk),
+      "报告含「单证最新状态」板块")
+inv = next(x for x in states if x["doc_name"] == doc)
+check(inv["at"] == "2026-09-10 09:00" and inv["action"] == "提交",
+      "最新状态取全局最后一次动作（跨天）")
 mw = reporting.build_report("weekly", "2026-09-07")
 check(mw["weekly_compare"] is None or isinstance(mw["weekly_compare"], dict),
       "周报对比字段存在（仅首份时 None）")
@@ -151,6 +170,67 @@ blocks = reporting.blocks(m2)
 # 强制走 txt（隔离环境无 python-docx 无碍）
 path, kind = report_exporter.export(m2, blocks, out_dir=os.path.join(_TMP, "reports"))
 check(kind in ("docx", "txt") and os.path.exists(path), "导出产出文件（T8）")
+
+
+print("== 9. 下一个工作日待办（标题改名 + 新增「单证」列） ==")
+# 找一个「次日为工作日」且次日有非 Done 节点的日报日期
+from datetime import date as _D, timedelta as _TD
+nodes_all = db.get_nodes(PID)
+target = None
+for off in range(0, 14):
+    ref = _D(2026, 9, 1) + _TD(days=off)
+    nxt = ref + _TD(days=1)
+    if nxt.weekday() in (5, 6):
+        continue
+    if any(n["status"] != "Done" and n["plan_start"] == nxt.strftime("%Y-%m-%d")
+           for n in nodes_all):
+        target = ref
+        break
+check(target is not None, "找到可用于验证的日报日期")
+
+md = reporting.build_report("daily", target)
+td = md["todo"]
+blk = reporting.blocks(md)
+h_next = [b for b in blk if b["t"] == "h" and "下一个工作日待办" in b["text"]]
+check(len(h_next) == 1, "日报板块标题为「下一个工作日待办」")
+check(not any(b["t"] == "h" and "未来待办" in b["text"] for b in blk),
+      "不再出现旧标题「未来待办」")
+todo_tbl = [b for b in blk if b["t"] == "table"
+            and b["header"][:1] == ["日期"] and "单证" in b["header"]]
+check(bool(todo_tbl), "待办表格已包含「单证」列")
+if todo_tbl:
+    check(todo_tbl[0]["header"] == ["日期", "优先级", "项目", "节点", "单证"],
+          f"表头为 日期/优先级/项目/节点/单证（实际 {todo_tbl[0]['header']}）")
+    check(all(len(r) == 5 for r in todo_tbl[0]["rows"]), "每行 5 列")
+check(all("docs" in it for it in td["items"]), "待办条目均带 docs 字段")
+
+# 单证列内容 = 该节点未提交的必填单证
+node_day = {}
+for it in td["items"]:
+    node_day[it["node"]] = it
+sample = next((it for it in td["items"] if it["docs"] != "—"), None)
+if sample:
+    nid = int(sample["node"].split("节点")[1].split(" ")[0])
+    want = sorted(f["doc_name"] for f in db.get_files(PID)
+                  if f.get("node_id") == nid and f["doc_type"] == "required"
+                  and f["status"] != "submitted")
+    got = sorted(sample["docs"].split("、"))
+    check(got == want, f"单证列 = 该节点未提交必填单证（{got}）")
+else:
+    check(False, "次日存在有单证待办的节点（用于验证单证列）")
+
+# 已提交的必填单证不应出现在单证列
+submitted_name = next((f["doc_name"] for f in db.get_files(PID)
+                       if f["status"] == "submitted" and f["doc_type"] == "required"
+                       and f.get("node_id") is not None), None)
+if submitted_name:
+    check(all(submitted_name not in it["docs"] for it in td["items"]),
+          f"已提交单证「{submitted_name}」不出现在待办单证列")
+
+mw2 = reporting.build_report("weekly", "2026-09-07")
+check(any(b["t"] == "h" and "下周待办" in b["text"] for b in reporting.blocks(mw2)),
+      "周报板块标题为「下周待办」")
+check(all("docs" in it for it in mw2["todo"]["items"]), "周报待办条目同样带 docs 字段")
 
 
 print("\n==== 结果 ====")
