@@ -23,6 +23,14 @@ from services.scheduler import apply_shift, undo_last_shift, ShiftError
 from services.vessel_status import fetch_latest_status
 from ui.theme import TEXT_SECONDARY, TEXT_TERTIARY, GRAY_SOFT
 
+
+def _oplog(*args, **kw):
+    try:
+        from services.oplog import record
+        return record(*args, **kw)
+    except Exception:
+        return None
+
 _HEADERS = ["#", "货名", "数量", "单位", "长(m)", "宽(m)", "高(m)", "毛重(kg)",
             "包装", "唛头/备注", "箱号", "封号", "超限"]
 
@@ -235,8 +243,18 @@ class CargoDialog(QDialog):
             return
         for i, it in enumerate(rows, start=1):
             it["seq"] = i
+        old_items = db.get_cargo_items(self._project_id)
+        old_t = sum((x.get("weight_kg") or 0) for x in old_items) / 1000.0
+        old_over = bool(summary(old_items)["over"]) if old_items else False
         db.delete_cargo_items(self._project_id)
         db.insert_cargo_items(self._project_id, rows)
+        new_t = sum((x.get("weight_kg") or 0) for x in rows) / 1000.0
+        new_over = bool(summary(rows)["over"])
+        if old_t != new_t or old_over != new_over:
+            det = f"总重：{old_t:.1f}t → {new_t:.1f}t"
+            if new_over:
+                det += "（触发超限）"
+            _oplog("cargo_edit", self._project_id, subject="货物台账", detail=det)
         self.accept()
 
 
@@ -433,6 +451,12 @@ class VesselDialog(QDialog):
             lon=self.lon_edit.value(),
             actual_eta=actual_eta,
             note=self.note_edit.text().strip() or None)
+        if actual_eta:
+            old_eta = (project or {}).get("eta")
+            det = (f"实际 ETA：{old_eta} → {actual_eta}" if old_eta
+                   else f"实际 ETA：{actual_eta}")
+            _oplog("vessel_position", self._project_id, subject=name or "船舶",
+                   detail=det)
 
         msg = "船位动态已登记留痕"
         if self.apply_check.isChecked() and actual_eta and project:

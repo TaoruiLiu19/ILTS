@@ -33,6 +33,14 @@ _UNITS = ["台", "套", "件", "箱", "捆", "卷", "批", "块", "吨", "米"]
 _PACKS = ["", "木箱", "裸装", "绑扎", "铁架", "托盘", "卷装", "散装"]
 
 
+def _oplog(*args, **kw):
+    try:
+        from services.oplog import record
+        return record(*args, **kw)
+    except Exception:
+        return None
+
+
 class CargoRow(QFrame):
     """货物台账单行录入控件"""
 
@@ -734,6 +742,7 @@ class NewProjectPage(QWidget):
             "buffer_days": buffer_days,
         }
         db.insert_project(project)
+        _oplog("project_create", project_id, subject=f"项目「{name}」", detail="新建项目")
 
         nodes = []
         for node in tmpl["nodes"]:

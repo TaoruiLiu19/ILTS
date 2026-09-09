@@ -6,7 +6,7 @@ from services.clock import get_today
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QScrollArea
+    QFrame, QScrollArea, QGridLayout
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
@@ -119,26 +119,35 @@ class HomePage(QWidget):
         self.reminder_bar.mousePressEvent = lambda e: self.navigate.emit("dashboard")
         layout.addWidget(self.reminder_bar)
 
-        # 三入口卡片
-        cards_layout = QHBoxLayout()
-        cards_layout.setSpacing(18)
+        # 四入口卡片（2×2）
+        cards_grid = QGridLayout(self)
+        cards_grid.setSpacing(18)
 
         self.card_active = EntryCard("dashboard", "进行中项目", "", 0,
                                      "box", GREEN, "#E8F8EC", self)
         self.card_active.clicked.connect(lambda k: self.navigate.emit(k))
-        cards_layout.addWidget(self.card_active, stretch=1)
 
         self.card_completed = EntryCard("completed", "已完成项目", "", 0,
                                         "folder", TEXT_SECONDARY, "#F2F2F7", self)
         self.card_completed.clicked.connect(lambda k: self.navigate.emit(k))
-        cards_layout.addWidget(self.card_completed, stretch=1)
 
         self.card_new = EntryCard("new_project", "新建项目", "创建新的物流跟踪", 0,
                                   "new", ACCENT, "#EAF3FF", self)
         self.card_new.clicked.connect(lambda k: self.navigate.emit(k))
-        cards_layout.addWidget(self.card_new, stretch=1)
 
-        layout.addLayout(cards_layout)
+        self.card_report = EntryCard("report", "生成报告", "日报 / 周报 · 一键导出", 0,
+                                     "doc", ACCENT, "#EAF3FF", self)
+        self.card_report.clicked.connect(lambda k: self.navigate.emit(k))
+
+        cards_grid.addWidget(self.card_active, 0, 0)
+        cards_grid.addWidget(self.card_completed, 0, 1)
+        cards_grid.addWidget(self.card_new, 1, 0)
+        cards_grid.addWidget(self.card_report, 1, 1)
+        cards_grid.setColumnStretch(0, 1)
+        cards_grid.setColumnStretch(1, 1)
+        grid_wrap = QWidget()
+        grid_wrap.setLayout(cards_grid)
+        layout.addWidget(grid_wrap)
 
         # 今日待办详情
         self.todo_section = QLabel("今日待办")

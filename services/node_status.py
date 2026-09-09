@@ -78,6 +78,13 @@ def sync_doc_completion(project_id):
         if n.get("status") != "Done" and past and all_sub:
             db.update_node(project_id, nid, status="Done",
                            actual_completion_date=today_s)
+            try:
+                from services.oplog import record as oplog_record
+                oplog_record(
+                    "node_done", project_id, node_id=nid, subject=f"节点{nid}",
+                    detail="单证齐备且已过计划结束日 → 自动完成")
+            except Exception:
+                pass
             changed += 1
         elif n.get("status") == "Done" and not all_sub:
             db.update_node(project_id, nid, status="Pending",

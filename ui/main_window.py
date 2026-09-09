@@ -18,6 +18,7 @@ from ui.pages.home_page import HomePage
 from ui.pages.dashboard_page import DashboardPage
 from ui.pages.new_project_page import NewProjectPage
 from ui.pages.completed_page import CompletedPage
+from ui.pages.report_page import ReportPage
 from services.reminder import compute_reminders, count_total
 
 
@@ -26,6 +27,7 @@ NAV_ITEMS = [
     ("dashboard", "主看板", "dashboard"),
     ("new_project", "新建项目", "new"),
     ("completed", "已完成", "completed"),
+    ("report",   "生成报告", "doc"),
 ]
 
 
@@ -90,7 +92,7 @@ class MainWindow(QMainWindow):
 
         sb_layout.addStretch()
 
-        version = QLabel("v6.4 · Demo")
+        version = QLabel("v6.5 · Demo")
         version.setObjectName("logoSub")
         version.setAlignment(Qt.AlignCenter)
         sb_layout.addWidget(version)
@@ -151,6 +153,10 @@ class MainWindow(QMainWindow):
         self.completed_page.navigate.connect(self._navigate)
         self.stack.addWidget(self.completed_page)
 
+        self.report_page = ReportPage()
+        self.report_page.navigate.connect(self._navigate)
+        self.stack.addWidget(self.report_page)
+
         right_layout.addWidget(self.stack, stretch=1)
 
         main_layout.addWidget(right, stretch=1)
@@ -202,6 +208,10 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.completed_page)
             self.completed_page.refresh()
             self.page_title.setText("已完成项目")
+        elif key == "report":
+            self.stack.setCurrentWidget(self.report_page)
+            self.report_page.refresh()
+            self.page_title.setText("生成报告")
 
         for k, (btn, glyph) in self.nav_buttons.items():
             active = k == key

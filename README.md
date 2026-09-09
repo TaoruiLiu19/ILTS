@@ -44,6 +44,14 @@
 - 今日待办（托盘徽章 + 今日待办对话框）、逾期/缓冲预警、单证超建议日与缺失提醒。
 - 已完成项目归档：只读甘特查看；内置两批演示数据（进行中 + 已完成历史批次）。
 
+### 日报 / 周报生成
+- 启动页四卡（2×2）新增「生成报告」入口；侧栏导航亦新增「生成报告」独立页。
+- **预览 → 生成两步（职责分离）**：先「预览报告」只渲染同源 HTML，满意后再点「生成」弹摘要确认框直接导出，两按钮互不自动触发。
+- **Word(.docx) 优先、纯文本降级**：装了 `python-docx` 导出带标题/表格/红色逾期缺失的 docx；未装则导出同名 .txt 并以【逾期】/【缺失】标红。文件写 `data/reports/`（已入库 .gitignore）。
+- 报告板块：总体概览（健康绿/黄/红）+ 未完成清单（缺证红标）+ 操作动态（日报到小时 / 周报按天分组）+ 未来待办（日报含周末提前预警；周报取下周自然周一~周日窗口）+ 智能摘要 +（周报）与上周对比 + 下周风险（实时读 cargo 当前值判超限）。
+- 操作日志 `op_log`：在新建/位移/撤销/自动完成/提交撤交单证/船位/货物变更等关键动作埋点；文件提交审计覆盖（同日同表单只余最新有效，底稿全留）、位移当日净收敛、撤销单独成条。
+- 编号 `RPT-YYYYMMDD-NNN` 按自然日独立重置；日期可回看任意历史日/周，头部标注「历史回溯数据」。
+
 ---
 
 ## 技术栈
@@ -75,6 +83,8 @@ python -X utf8 _opt_test_logic.py
 QT_QPA_PLATFORM=offscreen python -X utf8 _opt_test_ui.py
 # 收纳稳定性 / 海运表头单调 / 单证自动完成
 python -X utf8 _opt_fix_check.py
+# 日报/周报聚合 · 日志收敛/审计/白名单 · 编号按日重置 · 风险实时判定
+python -X utf8 _opt_test_report.py
 ```
 
 ## 目录结构（仓库仅代码与 README）
@@ -82,23 +92,26 @@ python -X utf8 _opt_fix_check.py
 ```
 app.py                      # 入口：初始化 DB + 演示数据 + 启动 GUI
 config.py                   # 国家模板 + 出口港薄壳（内部指向 services/ports）
-db.py                       # SQLite 数据层（项目/节点/单证/货物/班轮/船位/位移历史）
+db.py                       # SQLite 数据层（项目/节点/单证/货物/班轮/船位/位移历史/op_log）
 mock_data.py                # 演示数据（进行中批次）
 mock_completed.py           # 演示数据（已完成历史批次）
 services/
   ports_cn.py               # ★ 40 港权威数据（单一可编辑文件：含坐标/检索字段/7 项资料/平台备注）
   ports.py                  # 港口检索(首字母/拼音/代码) / get_port / merge_node_notes / 能力解析
-  scheduler.py              # 排程 + shift_node 推迟/提前（四守卫）+ apply/undo
+  scheduler.py              # 排程 + shift_node 推迟/提前（四守卫）+ apply/undo（埋 node_shift/unshift）
   file_checklist.py         # 单证 bootstrap + due 计算
-  node_status.py            # 节点状态机 + 必填齐·过期末自动完成
+  node_status.py            # 节点状态机 + 必填齐·过期末自动完成（埋 node_done）
+  oplog.py                  # ★ 操作日志统一入口（白名单/审计覆盖/位移当日净收敛）
+  reporting.py              # ★ 报告聚合纯逻辑（概览/未完成/动态/待办/摘要/周对比/风险/blocks）
+  report_exporter.py        # ★ docx(可选)/txt 导出 + 按日重置编号 RPT-…-NNN
   reminder.py / clock.py / cargo_check.py / vessel_status.py
 tools/
   gen_ports.py              # 可选：md 一次性导入生成 ports_cn.py；--check 数据自检
 ui/
-  main_window.py            # 侧栏 + 顶栏(今日待办/测试时间)
+  main_window.py            # 侧栏 + 顶栏(今日待办/测试时间) + 生成报告页
   map_geo.py                # 地图地理投影工具（轮廓/投影）
-  dialogs.py                # 货物台账 / 班轮船位 / 今日待办 对话框
-  pages/                    # home / dashboard / new_project(含港口查询对话框) / completed
+  dialogs.py                # 货物台账 / 班轮船位 / 今日待办 对话框（埋点）
+  pages/                    # home(四卡) / dashboard / new_project(含港口查询对话框) / completed / report
   widgets/                  # gantt_grid、file_panel、node_popover(速览卡)、collapsible、
                             # port_map(地图定位组件)、mini_bar、icons、theme
 ```

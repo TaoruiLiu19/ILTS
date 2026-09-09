@@ -23,6 +23,11 @@ from services.file_checklist import bootstrap
 from config import get_port
 
 
+def _oplog(*args, **kw):
+    from services.oplog import record
+    return record(*args, **kw)
+
+
 def seed_demo():
     """如果数据库为空，灌入 Mock 演示数据"""
     if db.count_projects("Active") > 0:
@@ -73,6 +78,28 @@ def seed_demo():
     print(f"  节点数: {len(nodes)} | 单证数: {len(files)}")
 
 
+def seed_oplog_demo():
+    """为演示项目灌入几条「今日操作动态」日志（一次性，settings 守卫）。
+    仅生成 op_log 时间线，不改动真实的节点/单证状态。"""
+    if db.get_setting("oplog_demo_seeded"):
+        return
+    projects = db.get_projects_by_status("Active")
+    if not projects:
+        return
+    pid = projects[0]["project_id"]
+    proj = db.get_project(pid)
+    # 节点1 必填单证「提交」
+    files = db.get_files(pid)
+    node1_file = next((f for f in files
+                       if f.get("node_id") == 1 and f["doc_type"] == "required"), None)
+    if node1_file:
+        _oplog("file_submit", pid, node_id=1, subject=node1_file["doc_name"],
+               detail="提交", created_at=f"{proj['create_date']} 09:1")
+    _oplog("vessel_position", pid, subject="船舶",
+           detail="登记实际 ETA（演示）", created_at=f"{proj['create_date']} 10:2")
+    db.set_setting("oplog_demo_seeded", "1")
+
+
 def main():
     # 初始化数据库
     db.init_db()
@@ -80,6 +107,7 @@ def main():
     # 灌入演示数据
     seed_demo()
     seed_completed_demo()
+    seed_oplog_demo()
 
     # 启动 GUI
     app = QApplication(sys.argv)

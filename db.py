@@ -142,6 +142,19 @@ CREATE TABLE IF NOT EXISTS shift_history (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sh_project ON shift_history(project_id, id);
+
+-- 日报/周报 · 操作日志（报告时间线 + 审计留痕）
+CREATE TABLE IF NOT EXISTS op_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  TEXT NOT NULL,
+    node_id     INTEGER,
+    kind        TEXT NOT NULL,
+    subject     TEXT NOT NULL DEFAULT '',
+    detail      TEXT,
+    valid       INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_opl_project ON op_log(project_id, created_at);
 """
 
 
@@ -413,6 +426,84 @@ def update_file(file_id, **kw):
     sets = ", ".join(f"{k}=?" for k in kw)
     conn.execute(f"UPDATE files SET {sets} WHERE file_id=?", (*kw.values(), file_id))
     conn.commit()
+
+
+# ── Op log（操作日志 · 报告时间线/审计） ──
+
+def insert_op_log(project_id, kind, subject="", detail=None, node_id=None,
+                   valid=1, created_at=None):
+    """写入一条操作日志。created_at 缺省取真实当下（分钟级）。"""
+    if created_at is None:
+        from datetime import datetime
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO op_log (project_id, node_id, kind, subject, detail, valid, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (project_id, node_id, kind, subject, detail, int(valid), created_at))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_op_log_range(project_id, start=None, end=None, valid_only=True, limit=1000):
+    """按 project_id + 时间区间（双条件，含边界）过滤；默认仅有效行。"""
+    conn = get_conn()
+    sql = "SELECT * FROM op_log WHERE project_id=?"
+    args = [project_id]
+    if start:
+        sql += " AND created_at >= ?"
+        args.append(start)
+    if end:
+        sql += " AND created_at <= ?"
+        args.append(end)
+    if valid_only:
+        sql += " AND valid=1"
+    sql += " ORDER BY id ASC"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    rows = conn.execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_op_log_all(start=None, end=None, valid_only=True, limit=2000):
+    """全项目操作日志（跨项目不混行：仍以 start/end 过滤，供报告聚合各项目后合并）。"""
+    conn = get_conn()
+    sql = "SELECT * FROM op_log WHERE 1=1"
+    args = []
+    if start:
+        sql += " AND created_at >= ?"
+        args.append(start)
+    if end:
+        sql += " AND created_at <= ?"
+        args.append(end)
+    if valid_only:
+        sql += " AND valid=1"
+    sql += " ORDER BY id ASC"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    rows = conn.execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def invalidate_op_log(cond_kwargs):
+    """把满足 {kind, subject, project_id, created_date?} 的有效行置 0（审计保留）。
+    用于『写前收敛』：提交覆盖、位移当日净收敛等。"""
+    conn = get_conn()
+    if "created_day" in cond_kwargs and cond_kwargs["created_day"]:
+        # 按当日（created_at LIKE 'YYYY-MM-DD%'）收敛
+        day = cond_kwargs.pop("created_day")
+        cond_kwargs["created_at_like"] = day + "%"
+    if "created_at_like" in cond_kwargs and cond_kwargs["created_at_like"]:
+        like = cond_kwargs.pop("created_at_like")
+        sql = "UPDATE op_log SET valid=0 WHERE valid=1 AND created_at LIKE ?"
+        args = [like]
+        for k, v in cond_kwargs.items():
+            sql += f" AND {k}=?"
+            args.append(v)
+        conn.execute(sql, args)
+        conn.commit()
 
 
 # ── Settings ──

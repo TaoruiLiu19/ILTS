@@ -210,7 +210,7 @@ def shift_node(nodes, from_node_id, days, today=None):
 
 # ── 高层服务：位移 → 全链路落库（nodes / project / shift_history / files due） ──
 
-def apply_shift(project_id, from_node_id, days):
+def apply_shift(project_id, from_node_id, days, oplog=True):
     """
     对项目执行一次位移并落库：
       1) shift_node 计算（含四守卫）
@@ -218,6 +218,7 @@ def apply_shift(project_id, from_node_id, days):
       3) 回写 projects.etd/eta（ETA 联动）
       4) 写入 shift_history（可撤销留痕）
       5) 单证 due_date 跟随重算（锚 node_start/node_end）
+    oplog=False 供撤销调用：撤销自身不再记 node_shift（由调用方记 node_unshift）。
     返回结果 dict；守卫拦截时抛 ShiftError（不产生任何写入）。
     """
     import db
@@ -238,6 +239,17 @@ def apply_shift(project_id, from_node_id, days):
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")  # 微秒级：保证同组/同秒可区分
     db.insert_shift_history(project_id, affected, int(days), created_at)
+
+    # 操作日志埋点（node_shift 主动调整）
+    if oplog:
+        try:
+            from services.oplog import record as oplog_record
+            oplog_record(
+                "node_shift", project_id, node_id=from_node_id, subject=f"节点{from_node_id}",
+                detail=f"{'推迟' if days > 0 else '提前'} {abs(days)} 天 · 影响 {len(affected)} 个节点",
+                delta=int(days))
+        except Exception:
+            pass  # 日志失败不影响位移主流程
 
     plan = {n["node_id"]: (n["plan_start"], n["plan_end"]) for n in updated}
     due_changed = db.recompute_files_due(project_id, plan)
@@ -266,8 +278,17 @@ def undo_last_shift(project_id):
     if not group:
         raise ShiftError("暂无位移历史可撤销")
     delta = group[0]["delta"]
+    undone_id = min(r["id"] for r in group)
     from_node = min(r["node_id"] for r in group)
-    res = apply_shift(project_id, from_node, -delta)
+    # 撤销自身不再记 node_shift；由下方单独记 node_unshift（带 shift_history 主键）
+    res = apply_shift(project_id, from_node, -delta, oplog=False)
+    try:
+        from services.oplog import record as oplog_record
+        oplog_record(
+            "node_unshift", project_id, node_id=from_node, subject=f"节点{from_node}",
+            detail=f"撤销位移 #{undone_id}（恢复至原计划）")
+    except Exception:
+        pass
     res["undone"] = True
     res["note"] = f"已撤销上一步（还原 {abs(delta)} 天）"
     return res

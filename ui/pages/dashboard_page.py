@@ -36,6 +36,15 @@ from ui.dialogs import CargoDialog, VesselDialog
 from ui.widgets.collapsible import CollapsibleSection
 
 
+def _oplog(*args, **kw):
+    """操作日志埋点薄封装：失败不影响主流程。"""
+    try:
+        from services.oplog import record
+        return record(*args, **kw)
+    except Exception:
+        return None
+
+
 def _parse(s):
     if isinstance(s, date):
         return s
@@ -609,10 +618,18 @@ class ProjectCard(QFrame):
 
     def _toggle_file(self, file_id, checked):
         from db import today_str
+        finfo = db.get_files(self._project["project_id"]) or []
+        doc = next((f for f in finfo if f["file_id"] == file_id), {})
+        doc_name = doc.get("doc_name", "")
+        node_id = doc.get("node_id")
         if checked:
             db.update_file(file_id, status="submitted", submitted_date=today_str())
+            _oplog("file_submit", self._project["project_id"], node_id=node_id,
+                   subject=doc_name, detail="提交")
         else:
             db.update_file(file_id, status="pending", submitted_date=None)
+            _oplog("file_withdraw", self._project["project_id"], node_id=node_id,
+                   subject=doc_name, detail="撤交")
         # 单证全交清 + 已过节点结束日 → 自动完成（反之回退）
         sync_doc_completion(self._project["project_id"])
         self._load()
