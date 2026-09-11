@@ -1,17 +1,21 @@
 """1A 地基无头验证：建库→播种→计划日期→船期变更→客户校验→状态推导。"""
-import os, sys, shutil
+import os, sys, shutil, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db
+
+# ★ 隔离临时库（务必在 import services / 建连接之前设置）
+#   本脚本原先直接删除并重建 data/logistics.db；被 _audit/run_tests.py 串入
+#   验收总表后，等于每次跑验收都会清掉真实演示数据（含用户手动新增的批次）。
+#   现改为独立临时库，与其它验收脚本口径一致。
+_TMP = tempfile.mkdtemp(prefix="verify_v2_")
+db.DB_PATH = os.path.join(_TMP, "t.db")
+db._conn = None
+db.init_db()
+
 from services import schedule2, schedule_change, batches as bsvc
 from services.node_template import SEA_TRANSIT
 from services.node_template import EXPORT_CUSTOMS, LOADING, EMPTY_RETURN
-
-# 干净重建
-for f in ("data/logistics.db", "data/logistics.db-wal", "data/logistics.db-shm"):
-    if os.path.exists(f):
-        os.remove(f)
-db.init_db()
 
 from mock_data import seed_demo_project, DEMO_PROJECT
 from mock_completed import seed_completed_demo
@@ -102,3 +106,12 @@ check("已完成项目状态 Completed", hist["status"] == "Completed")
 
 print("\n===== 1A 后端验证通过 %d 项 =====" % len(PASS))
 print(PASS)
+
+# 收尾：关闭连接并清理临时库（Windows 下文件被占用时静默跳过）
+try:
+    if db._conn is not None:
+        db._conn.close()
+        db._conn = None
+except Exception:
+    pass
+shutil.rmtree(_TMP, ignore_errors=True)

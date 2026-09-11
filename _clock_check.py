@@ -16,7 +16,7 @@ from services import reporting
 from services.oplog import record
 from services.scheduler import apply_shift
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 
 FAILED = []
 
@@ -41,7 +41,7 @@ for n in DEMO_NODES:
                   "default_duration": n["duration"], "duration": n["duration"],
                   "plan_start": s, "plan_end": e, "remark": n.get("remark", "")})
 db.insert_nodes(pid, nodes)
-db.insert_files(pid, bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan))
+seed_files(pid, DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
 
 print("== 1. 未模拟：走真实时间 ==")
 reset()

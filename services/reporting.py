@@ -494,18 +494,48 @@ def last_file_states(projects, scope=None):
 
     数据来源：`files.status/submitted_date`（当前态）+ `op_log` 最后一条单证动作（时间/动作）。
     返回按项目分组的最新状态行，供报告「单证最新状态」板块（含批次维度）。
+
+    v6.10 修两处口径：
+      · 动作按 **(批次, 单证名)** 取 —— 原先按单证名取全局最后一条，会把 B02 的提交时间
+        套到 B01 同名单证上（多批次下报告串批次）；
+      · **项目级单证**（项目日报/物流动态跟踪表/项目进度报告，存 project_files）同项目
+        只出现一次，批次列显示「项目级」，不再按批次各列一行。
     """
     scope = scope or ReportScope()
     out = []
     for p in projects:
         pid = p["project_id"]
         pname = p.get("project_name") or pid
-        last = db.last_file_actions(pid)
+        acts = db.last_file_actions_by_batch(pid)
+
+        # 项目级单证（同项目一份，不挂批次）
+        for f in db.get_project_files(pid):
+            act = acts.get((None, f["doc_name"]))
+            submitted = f.get("status") == "submitted"
+            if act:
+                kind_label = "提交" if act["kind"] == "file_submit" else "撤销"
+                at = act["created_at"]
+            else:
+                kind_label = "提交" if submitted else "—"
+                at = (f.get("submitted_date") or "")[:16] if submitted else ""
+            out.append({
+                "project": pname,
+                "batch": "项目级",
+                "scope": "project",
+                "node_id": None,
+                "doc_name": f["doc_name"],
+                "doc_type": f["doc_type"],
+                "state": "已提交" if submitted else "未提交",
+                "action": kind_label,
+                "at": at,
+            })
+
         for b in scope.batches(pid):
             if not scope.batch_ok(b["batch_id"]):
                 continue
-            for f in scope.files(pid, b["batch_id"]):
-                act = last.get(f["doc_name"])
+            bid = b["batch_id"]
+            for f in scope.files(pid, bid):
+                act = acts.get((bid, f["doc_name"]))
                 submitted = f.get("status") == "submitted"
                 if act:
                     kind_label = "提交" if act["kind"] == "file_submit" else "撤销"
@@ -517,6 +547,7 @@ def last_file_states(projects, scope=None):
                 out.append({
                     "project": pname,
                     "batch": batch_label(b),
+                    "scope": "batch",
                     "node_id": f.get("node_id"),
                     "doc_name": f["doc_name"],
                     "doc_type": f["doc_type"],

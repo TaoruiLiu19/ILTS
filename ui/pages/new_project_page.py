@@ -23,7 +23,7 @@ from config import COUNTRIES, PORTS, get_country, get_port
 from services.ports import search_ports, list_tree, merge_node_notes, platform_note
 from services.schedule2 import compute_plan
 from services import modes as mode_names
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 from services.cargo_check import normalize_item, item_over_types, summary
 from ui.theme import (
     ACCENT, ACCENT_SOFT, RED, GREEN, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -1041,9 +1041,8 @@ class NewProjectPage(QWidget):
             })
         db.insert_nodes(project_id, db_nodes, batch_id=batch_id)
 
-        # 5. 单证清单
-        files = bootstrap(country_code, port_code, plan)
-        db.insert_files(project_id, files, batch_id=batch_id)
+        # 5. 单证清单（批次级 → files；项目级 → project_files，同项目一份）
+        file_counts = seed_files(project_id, country_code, port_code, plan, batch_id=batch_id)
 
         # 6. 货物台账
         cargo_count = 0
@@ -1091,7 +1090,9 @@ class NewProjectPage(QWidget):
         cargo_text = f"，货物 {cargo_count} 项" + ("，含超限件" if over_count else "")
         mode_text = f"，线路模式 {mode_names.label(mode_primary)}"
         warn_text = f"；提示 {len(warn)} 项（详见批次管理）" if warn else ""
-        self.toast.emit(f'项目「{name}」已创建，生成 {len(db_nodes)} 节点与 {len(files)} 份单证清单'
+        n_files = file_counts["batch"] + file_counts["project"]
+        self.toast.emit(f'项目「{name}」已创建，生成 {len(db_nodes)} 节点与 {n_files} 份单证清单'
+                        f'（批次级 {file_counts["batch"]} + 项目级 {file_counts["project"]}）'
                         f'{mode_text}{cargo_text}{port_text}{warn_text}')
         self.navigate.emit("dashboard")
 

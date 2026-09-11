@@ -9,16 +9,49 @@
   · T9–T10 / T17–T18 / T20–T21 / T29–T30：由 1B/1C 专项套件覆盖，
     本文件通过子进程运行它们并把结论并入总表（缺失则标记 SKIP 并计入失败）
 
-所有用例均在**隔离临时库**上运行，不触碰 data/logistics.db。
+数据安全（**注意不是全隔离**）：
+  · 本文件内联用例与 1A/1B/1C 专项套件均在隔离临时库上运行（db.DB_PATH → tempdir）；
+  · 但 T1（tools/test_migrate.py）会在 data/ 下重建 logistics.legacy.db* 迁移样本库；
+  · T12（_audit/run_tests.py）会串跑若干直接读写 data/logistics.db 的脚本
+    （其中 _reset_check.py 会清空真实库 op_log）。
+  · 因此本脚本启动时会自动把 data/logistics.db 备份为
+    data/logistics.db.auto-<时间戳>（保留最近 3 份），需要时直接 copy 回去即可还原。
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+
+def _guard_real_db():
+    """真实库护栏：跑验收前留一份备份（T12 串跑的脚本会读写真实库）。"""
+    real = os.path.join(ROOT, "data", "logistics.db")
+    data_dir = os.path.join(ROOT, "data")
+    if not os.path.exists(real):
+        return None
+    dst = os.path.join(data_dir,
+                       f"logistics.db.auto-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    try:
+        shutil.copy2(real, dst)
+    except Exception as e:
+        print(f"[GUARD] 真实库备份失败：{e}")
+        return None
+    autos = sorted(f for f in os.listdir(data_dir) if f.startswith("logistics.db.auto-"))
+    for old in autos[:-3]:
+        try:
+            os.remove(os.path.join(data_dir, old))
+        except Exception:
+            pass
+    print(f"[GUARD] 真实库已备份 → data/{os.path.basename(dst)}")
+    return dst
+
+
+_guard_real_db()
 
 import db
 
@@ -168,9 +201,15 @@ print("== T12 回归 ==")
 rr = subprocess.run([sys.executable, os.path.join("_audit", "run_tests.py")], cwd=ROOT,
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
                     env=dict(os.environ, PYTHONUTF8="1"))
-tail = [l for l in (rr.stdout or "").splitlines() if "通过 ==" in l or "未通过" in l]
-rec("T12", "17/17" in (rr.stdout or "") or ("/18 通过" in (rr.stdout or "")
-    and "未通过" not in (rr.stdout or "")), f"回归套件：{tail[0] if tail else 'n/a'}")
+_out = rr.stdout or ""
+tail = [l for l in _out.splitlines() if "通过 ==" in l or "未通过" in l]
+# 用例数会随回归集增删变化，故按 "N/N 通过" 解析（全部通过 + 无失败清单）而非写死 18
+import re as _re
+_m = _re.search(r"===\s*(\d+)/(\d+)\s*通过\s*===", _out)
+_passed, _total = (int(_m.group(1)), int(_m.group(2))) if _m else (0, 0)
+rec("T12", rr.returncode == 0 and _total > 0 and _passed == _total
+    and "未通过" not in _out,
+    f"回归套件：{tail[0] if tail else 'n/a'}")
 
 print("== T13 批次号/重命名 ==")
 pid13, b13 = new_proj("t13")

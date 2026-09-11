@@ -162,6 +162,28 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_batch ON files(batch_id, node_key);
 
+-- 项目级单证（§10.1 无节点锚点的条目：《项目日报》《物流动态跟踪表》《项目进度报告》）
+-- 为什么单开一张表：这些单证与批次无关，旧口径按批次各复制一份 → 3 个批次 9 行、
+-- 用户要提交 3 次、报告里重复出现。files 表结构与其 batch_id NOT NULL 不变量
+-- （tools/migrate_batches.py 的「files.batch_id IS NULL 必须为 0」）保持不变，项目级行走本表。
+CREATE TABLE IF NOT EXISTS project_files (
+    project_file_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id         TEXT NOT NULL,
+    doc_name           TEXT NOT NULL,
+    doc_type           TEXT NOT NULL CHECK (doc_type IN ('required','optional')),
+    owner_dept         TEXT,
+    copies             INTEGER,
+    remind_before_days INTEGER DEFAULT 3,
+    status             TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','submitted')),
+    submitted_date     TEXT,
+    owner              TEXT,
+    note               TEXT,
+    is_default         INTEGER NOT NULL DEFAULT 1,
+    created_at         TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_files_doc ON project_files(project_id, doc_name);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -365,6 +387,8 @@ def init_db():
     else:
         _rebuild_clean(conn)
     _ensure_columns(conn)
+    # 项目级单证一次性迁移（老库里的 9 行重复项 → project_files 3 行）；幂等，见函数内守卫
+    _migrate_project_files(conn)
     conn.commit()
     # §10.1/10.2/10.3 单证字典与规则主数据（幂等播种）
     try:
@@ -417,7 +441,7 @@ def _rebuild_clean(conn):
              "party_roles", "parties", "doc_dependencies", "reminder_rules",
              "doc_types", "insurance_policies",
              "container_batch_link", "containers", "vessel_positions", "vessel",
-             "cargo_items", "files", "nodes", "shift_history", "op_log", "batches",
+             "cargo_items", "files", "project_files", "nodes", "shift_history", "op_log", "batches",
              "batch_routes", "projects", "settings", "migration_status"]
     for t in owned:
         try:
@@ -426,6 +450,84 @@ def _rebuild_clean(conn):
             pass
     conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     conn.executescript(SCHEMA_SQL)
+
+
+# 项目级单证迁移的一次性守卫键（settings）：迁移过就不再扫库
+_PROJECT_FILES_MIGRATION_KEY = "project_files_migrated_v1"
+
+
+def _migrate_project_files(conn):
+    """一次性迁移：把 files 里「项目级单证」搬进 project_files（每项目一份）。
+
+    为什么需要迁移：这些单证在 files 里无节点锚点（node_key/due_node_key/due_type/due_rule
+    全为 NULL，与 services/file_checklist 的 files_project 展开口径一致），却被旧口径按批次
+    各复制一份 —— 3 个批次就是 9 行，用户要提交 3 次、报告里出现 9 行。新表按项目只留一份。
+
+    取哪一条：按 (project_id, doc_name) 分组保留最早一条（file_id 最小）的字段；各批次行
+    字段同源，取最早即最接近模板。status 取组内「最强态」——任一批次已提交则该单证在整个
+    项目上视为已提交；submitted_date 取组内最早的已提交日期。
+
+    幂等与安全：settings 键 project_files_migrated_v1 守卫（已迁直接返回）；迁移异常一律
+    吞掉并打印一行中文提示 —— 迁移失败绝不能让 init_db() 崩（否则用户连库都打不开）；
+    project_files 上的唯一索引 (project_id, doc_name) 保证重跑只 IGNORE 不重复。
+    """
+    try:
+        if conn.execute("SELECT 1 FROM settings WHERE key=?",
+                        (_PROJECT_FILES_MIGRATION_KEY,)).fetchone():
+            return
+        rows = conn.execute(
+            "SELECT * FROM files WHERE node_key IS NULL AND due_node_key IS NULL "
+            "AND due_type IS NULL AND due_rule IS NULL "
+            "ORDER BY project_id, doc_name, file_id").fetchall()
+        if rows:
+            groups = {}
+            for r in rows:
+                groups.setdefault((r["project_id"], r["doc_name"]), []).append(r)
+            for (project_id, doc_name), grp in groups.items():
+                head = grp[0]                       # 最早一条（file_id 最小）
+                done = [g["submitted_date"] for g in grp if g["status"] == "submitted"]
+                dates = sorted([d for d in done if d])
+                conn.execute(
+                    "INSERT OR IGNORE INTO project_files (project_id, doc_name, doc_type, "
+                    "owner_dept, copies, remind_before_days, status, submitted_date, owner, "
+                    "note, is_default, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (project_id, doc_name, head["doc_type"], head["owner_dept"], head["copies"],
+                     head["remind_before_days"],
+                     "submitted" if done else "pending", dates[0] if dates else None,
+                     head["owner"], head["note"], 1 if head["is_default"] else 0, _now()))
+            # 搬完即从 files 删除这些行：否则批次单证列表/统计仍会把它们算进去（重复计数）
+            ids = [r["file_id"] for r in rows]
+            conn.execute(f"DELETE FROM files WHERE file_id IN ({','.join('?' * len(ids))})", ids)
+            conn.commit()
+            # 只读校验：迁移不得破坏既有不变量（files 全部挂批次）
+            left = conn.execute("SELECT COUNT(*) AS c FROM files WHERE batch_id IS NULL").fetchone()["c"]
+            print(f"[迁移] 项目级单证：搬运 {len(groups)} 行到 project_files（涉及 files 原行 "
+                  f"{len(ids)} 行，已删除）" + (f"；警告：files.batch_id IS NULL 仍有 {left} 行" if left else ""))
+            # 只在**确实有东西可搬**时才落守卫：全新库/已收敛库保持"可重扫"，
+            # 否则先 init_db() 再播种的旧写入路径产出的行永远不会被搬（守卫会把它挡掉）。
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+                         (_PROJECT_FILES_MIGRATION_KEY, _now()))
+            conn.commit()
+        else:
+            return
+    except Exception as e:            # noqa: BLE001 —— 启动路径绝不因迁移失败而中断
+        print(f"[迁移] 项目级单证迁移未完成（已跳过，不影响启动，下次启动会重试）：{e}")
+
+
+def migrate_project_files_now():
+    """手动重跑「项目级单证单库一份」迁移：清守卫后立即执行。
+
+    用途：升级后想立刻把存量库里"按批次复制的项目级单证"收敛到 project_files
+    （正常路径下 `init_db()` 只要发现候选行就会自动搬，本函数用于强制再扫一次）。
+    返回 {"added": 新增行数, "total": 现有行数}。
+    """
+    conn = get_conn()
+    conn.execute("DELETE FROM settings WHERE key=?", (_PROJECT_FILES_MIGRATION_KEY,))
+    conn.commit()
+    before = conn.execute("SELECT COUNT(*) AS c FROM project_files").fetchone()["c"]
+    _migrate_project_files(conn)
+    after = conn.execute("SELECT COUNT(*) AS c FROM project_files").fetchone()["c"]
+    return {"added": after - before, "total": after}
 
 
 def today_str():
@@ -1276,14 +1378,22 @@ def get_files(project_id, batch_id=None):
     conn = get_conn()
     rows = conn.execute(
         "SELECT * FROM files WHERE batch_id=? ORDER BY node_id, file_id", (batch_id,)).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    # scope 只是新增字段（键与排序不动）：UI 把批次单证与 project_files（scope='project'）
+    # 拼在同一列表渲染时靠它区分归属，也便于回写时选对表。
+    for r in out:
+        r["scope"] = "batch"
+    return out
 
 
 def get_files_by_batch(batch_id):
     conn = get_conn()
     rows = conn.execute(
         "SELECT * FROM files WHERE batch_id=? ORDER BY node_id, file_id", (batch_id,)).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    for r in out:
+        r["scope"] = "batch"
+    return out
 
 
 def update_file(file_id, **kw):
@@ -1295,6 +1405,104 @@ def update_file(file_id, **kw):
         sets = ", ".join(f"{k}=?" for k in kw)
         conn.execute(f"UPDATE files SET {sets} WHERE file_id=?", (*kw.values(), file_id))
         conn.commit()
+
+
+# ── Project files（项目级单证，单库一份；与 files 行结构兼容） ──
+
+def _project_file_row(row):
+    """把 project_files 行整形成与 files 行同构的 dict（UI 两者拼同一列表渲染）。
+
+    file_id 为什么带 "pf-" 前缀：files.file_id 是数字主键，两张表自增序列各自独立，
+    裸数字会与批次单证撞车（勾选/提交回写会打错表）；无锚点字段一律补 None。
+    """
+    r = dict(row)
+    return {
+        "file_id": f"pf-{r['project_file_id']}",
+        "project_file_id": r["project_file_id"],
+        "scope": "project",
+        "batch_id": None,                 # 项目级单证不挂批次（files.batch_id 的对应位）
+        "project_id": r["project_id"],
+        "node_id": None, "node_key": None,
+        "due_node_id": None, "due_node_key": None,
+        "due_type": None, "due_rule": None, "due_hours": None,
+        "baseline_source": None, "due_date": None,
+        "doc_name": r["doc_name"], "doc_type": r["doc_type"],
+        "owner_dept": r["owner_dept"], "copies": r["copies"],
+        "remind_before_days": r["remind_before_days"],
+        "status": r["status"], "submitted_date": r["submitted_date"],
+        "owner": r["owner"], "note": r["note"], "is_default": r["is_default"],
+        "created_at": r["created_at"],
+    }
+
+
+def _project_file_id(file_id):
+    """接受 "pf-123" 或裸 123（UI 混排两类行，回写时拿到的可能是字符串）。"""
+    if isinstance(file_id, str) and file_id.startswith("pf-"):
+        return int(file_id[3:])
+    return int(file_id)
+
+
+def insert_project_files(project_id, files: list):
+    """写入项目级单证；同项目同 doc_name 已存在则跳过（INSERT OR IGNORE 语义）。
+
+    为什么幂等：老库迁移、重复播种、批次复制都会再次送来同名条目，而项目级只该有一份；
+    靠唯一索引 (project_id, doc_name) 兜底，调用方无需先查后写（避免竞态与噪音）。
+    """
+    conn = get_conn()
+    for f in files:
+        conn.execute(
+            "INSERT OR IGNORE INTO project_files (project_id, doc_name, doc_type, owner_dept, "
+            "copies, remind_before_days, status, submitted_date, owner, note, is_default, "
+            "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (project_id, f["doc_name"], f["doc_type"], f.get("owner_dept"), f.get("copies"),
+             f.get("remind_before_days", 3), f.get("status") or "pending",
+             f.get("submitted_date"), f.get("owner"), f.get("note", ""),
+             1 if f.get("is_default", 1) else 0, _now()))
+    conn.commit()
+
+
+def get_project_files(project_id):
+    """项目级单证（项目内一份，不分批次）；行结构与 files 行兼容，见 _project_file_row。"""
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM project_files WHERE project_id=? "
+                        "ORDER BY project_file_id", (project_id,)).fetchall()
+    return [_project_file_row(r) for r in rows]
+
+
+def get_project_file(file_id):
+    """单个项目级单证（支持 "pf-123" 或 123）；不存在返回 None。"""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM project_files WHERE project_file_id=?",
+                       (_project_file_id(file_id),)).fetchone()
+    return _project_file_row(row) if row else None
+
+
+def update_project_file(file_id, **kw):
+    """更新项目级单证（支持 "pf-123" 或 123）。
+
+    status 与 submitted_date 的联动由调用方决定（与 update_file 同口径：后端不猜业务），
+    submitted_date 随 status 一起传进来即可。
+    """
+    conn = get_conn()
+    if kw:
+        sets = ", ".join(f"{k}=?" for k in kw)
+        conn.execute(f"UPDATE project_files SET {sets} WHERE project_file_id=?",
+                     (*kw.values(), _project_file_id(file_id)))
+        conn.commit()
+
+
+def count_project_files(project_id):
+    """项目级单证统计；口径与 services/file_checklist.count_files 一致（pending 只算 required）。"""
+    conn = get_conn()
+    rows = conn.execute("SELECT doc_type, status FROM project_files WHERE project_id=?",
+                        (project_id,)).fetchall()
+    return {
+        "total": len(rows),
+        "required": len([r for r in rows if r["doc_type"] == "required"]),
+        "pending": len([r for r in rows if r["doc_type"] == "required"
+                        and r["status"] == "pending"]),
+        "submitted": len([r for r in rows if r["status"] == "submitted"]),
+    }
 
 
 # ── Op log ──
@@ -1392,6 +1600,11 @@ def delete_op_log(cond):
         sql += " AND created_at LIKE ?"
         args.append(day + "%")
     for k, v in cond.items():
+        if v is None:
+            # None 必须走 IS NULL：`batch_id = NULL` 在 SQL 里永远不成立，
+            # 项目级单证/旧日志行（batch_id 为空）的收敛删除就靠这一支。
+            sql += f" AND {k} IS NULL"
+            continue
         if isinstance(v, (tuple, list, set)):
             v = list(v)
             if not v:
@@ -1414,6 +1627,25 @@ def last_file_actions(project_id, batch_id=None):
     out = {}
     for r in rows:
         key = r["subject"] or ""
+        if key not in out:
+            out[key] = dict(r)
+    return out
+
+
+def last_file_actions_by_batch(project_id):
+    """按 (批次, 单证名) 取最后一次提交/撤交动作：{(batch_id_or_None, doc_name): row}。
+
+    为什么要它：报告按项目汇总时，同名单证在多个批次各有一条动作；last_file_actions 按
+    doc_name 去重（历史调用方依赖其行为，不改），会把 A 批次的动作盖到 B 批次上 —— 报告因此
+    串批次。本函数保留批次维度；项目级动作的 batch_id 为 None，键即 (None, doc_name)。
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM op_log WHERE project_id=? AND kind IN ('file_submit','file_withdraw') "
+        f"ORDER BY {_TS_EXPR} DESC, id DESC", (project_id,)).fetchall()
+    out = {}
+    for r in rows:
+        key = (r["batch_id"], r["subject"] or "")
         if key not in out:
             out[key] = dict(r)
     return out

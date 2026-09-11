@@ -77,6 +77,7 @@ class BatchDialog(QDialog):
         proj = db.get_project(project_id)
         self._batch_id = batch_id or db.current_batch_id(project_id)
         self._project_no = (proj or {}).get("project_no") or "P"
+        self.auto_note = ""      # 保存后回传给调用方的提示（如「已按模板生成节点」）
         self.setWindowTitle("批次管理")
         self.setMinimumSize(820, 640)
         self._build()
@@ -87,6 +88,17 @@ class BatchDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 18, 20, 16)
         lay.setSpacing(12)
+
+        # 空批次提示：新增批次尚无节点 → 保存后按标准模板补齐（甘特图才有内容）
+        self.empty_hint = QLabel(
+            "本批次尚无计划节点：确认 ETD / ETA 后点「保存批次」，"
+            "将按 15 节点标准模板自动生成计划节点与单证清单。")
+        self.empty_hint.setWordWrap(True)
+        self.empty_hint.setStyleSheet(
+            f"font-size: 12px; color: {ACCENT}; background: {ACCENT_SOFT};"
+            f" border-radius: 10px; padding: 10px 12px;")
+        self.empty_hint.setVisible(False)
+        lay.addWidget(self.empty_hint)
 
         scroll_host = QWidget()
         sv = QVBoxLayout(scroll_host)
@@ -345,6 +357,10 @@ class BatchDialog(QDialog):
             if ids:
                 combo.setCurrentIndex(max(0, 1 + self._party_index(role, ids[0])))
 
+        # 空批次（无节点）→ 顶部提示「保存后按模板生成」
+        if getattr(self, "empty_hint", None) is not None:
+            self.empty_hint.setVisible(not db.get_nodes_by_batch(self._batch_id))
+
     def _box_row(self, r, c=None):
         c = c or {}
         vals = [c.get("container_no", ""), c.get("seal_no", ""),
@@ -507,6 +523,20 @@ class BatchDialog(QDialog):
             schedule2.recompute_batch_schedule(
                 self._project_id, batch_id=self._batch_id,
                 reason=f"批次编辑船期 {old_etd}~{old_eta}→{etd}~{eta}")
+
+        # 空批次（新增批次尚未建节点）→ 按 15 节点标准模板补齐节点 + 单证清单
+        # 否则该批次永远 0 节点，看板甘特图无内容可画。
+        filled = batches_svc.ensure_batch_nodes(
+            self._project_id, self._batch_id,
+            reason=f"批次管理保存（船期 {etd} → {eta}）")
+        self.auto_note = ""
+        if filled.get("created"):
+            self.auto_note = (f"已按 15 节点标准模板生成 {filled['nodes']} 个计划节点"
+                              f"与 {filled['files']} 份单证清单。")
+        elif filled.get("reason") and not db.get_nodes_by_batch(self._batch_id):
+            self.auto_note = f"未生成计划节点：{filled['reason']}。"
+        if getattr(self, "empty_hint", None) is not None:
+            self.empty_hint.setVisible(not db.get_nodes_by_batch(self._batch_id))
 
         # 派生批次状态
         st = batches_svc.derive_batch_status(self._batch_id)

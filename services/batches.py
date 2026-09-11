@@ -597,3 +597,133 @@ def copy_batch(project_id, source_batch_id, new_batch_no=None, batch_name=None,
     sync_batch_status(batch_id)
     update_project_status(project_id)
     return db.get_batch(batch_id)
+
+
+# ── §12.1 批次指标 / 项目风险汇总（看板摘要卡与甘特工作台共用） ──
+
+def batch_metrics(batch_id, today=None):
+    """单批次汇总：线路 / 状态 / 发运日 / 单证完成率 / 待办数 / 逾期节点数。
+
+    供「批次列表」表格与合并甘特的图例使用；纯只读。
+    """
+    if today is None:
+        from services.clock import get_today
+        today = get_today()
+    from services.node_status import compute_node_status
+    nodes = db.get_nodes_by_batch(batch_id)
+    files = db.get_files_by_batch(batch_id)
+    route = db.get_route(batch_id) or {}
+    b = db.get_batch(batch_id) or {}
+    n_done = sum(1 for n in nodes if n.get("status") == "Done")
+    req = [f for f in files if f.get("doc_type") == "required"]
+    submitted = sum(1 for f in req if f.get("status") == "submitted")
+    overdue = sum(1 for n in nodes if compute_node_status(n, today) == "Overdue")
+    pending = len(req) - submitted
+    return {
+        "batch_id": batch_id,
+        "batch_no": b.get("batch_no") or "",
+        "batch_name": b.get("batch_name") or "",
+        "status": b.get("status") or "draft",
+        "status_cn": state_label(b.get("status") or "draft"),
+        "mode": route.get("mode_primary") or "SEA",
+        "port": route.get("export_port") or "",
+        "etd": route.get("etd") or "",
+        "eta": route.get("eta") or "",
+        "node_done": n_done, "node_total": len(nodes),
+        "doc_rate": (submitted / len(req) * 100) if req else 0.0,
+        "doc_total": len(req), "doc_submitted": submitted,
+        "todo": pending, "overdue": overdue,
+    }
+
+
+def project_risk_summary(project_id, today=None):
+    """项目级风险汇总：N 批次 · 逾期节点 X · 待办单证 Y（含已取消的当前批次）。
+
+    与看板卡片批次条右侧那行「N 批次 · 逾期节点 X · 待办单证 Y」同源。
+    """
+    batches = list(db.get_batches(project_id))
+    cur = db.get_batch(db.current_batch_id(project_id))
+    if cur and cur.get("status") == "cancelled" and \
+            not any(b["batch_id"] == cur["batch_id"] for b in batches):
+        batches.append(cur)
+    overdue = todo = 0
+    for bt in batches:
+        m = batch_metrics(bt["batch_id"], today)
+        overdue += m["overdue"]
+        todo += m["todo"]
+    return {"n_batch": len(batches), "overdue": overdue, "todo": todo}
+
+
+# ── §12.1 空批次「补齐节点 + 单证」（按 15 节点标准模板实例化，幂等） ──
+
+def ensure_batch_nodes(project_id, batch_id, reason="补齐批次线路"):
+    """为**尚无任何节点**的批次按标准模板实例化 15 个节点并展开单证清单。
+
+    背景：`db.create_batch()`（新增批次）只往 batches 表写一行，不建线路/节点/单证
+    （只有 copy_batch 复制批次才建）。若后续不在「批次管理」填 ETD/ETA 并补齐节点，
+    该批次永远 0 节点 → 看板甘特图为空。本函数是该补齐动作的唯一入口。
+
+    幂等与安全：
+      · 已有节点（哪怕 1 个）→ 原样返回，不重复插入；
+      · 缺 ETD/ETA 或 ETA ≤ ETD → 不动作，返回原因；
+      · 已取消批次 → 不动作（§8 取消期间禁止写入）。
+    返回 {"created": bool, "nodes": int, "files": int, "reason": str|None}
+    """
+    batch = db.get_batch(batch_id)
+    if not batch:
+        return {"created": False, "nodes": 0, "files": 0, "reason": "批次不存在"}
+    if batch.get("status") == "cancelled":
+        return {"created": False, "nodes": 0, "files": 0, "reason": "批次已取消，禁止写入"}
+    if db.get_nodes_by_batch(batch_id):
+        return {"created": False, "nodes": 0, "files": 0, "reason": None}
+
+    route = db.get_route(batch_id) or {}
+    etd, eta = route.get("etd"), route.get("eta")
+    if not etd or not eta:
+        return {"created": False, "nodes": 0, "files": 0, "reason": "缺 ETD/ETA"}
+
+    proj = db.get_project(project_id) or {}
+    country = route.get("country") or proj.get("country")
+    port = route.get("export_port") or proj.get("export_port")
+
+    from services import schedule2
+    from services.ports import merge_node_notes
+
+    tpl = nt.template()
+    try:
+        plan = schedule2.compute_plan(etd, eta, tpl)
+    except schedule2.ScheduleError as e:
+        return {"created": False, "nodes": 0, "files": 0, "reason": str(e)}
+
+    nodes = []
+    for n in tpl:
+        s, e = plan[n["node_key"]]
+        nodes.append({
+            "node_id": n["node_id"], "node_key": n["node_key"],
+            "node_name": n["node_name"], "role_label": n["role_label"],
+            "seq": n["seq"], "area": n["area"],
+            "calendar_mode": n["calendar_mode"], "key_node": n["key_node"],
+            "default_duration": n["default_duration"], "duration": n["duration"],
+            "status": "Pending", "plan_start": s, "plan_end": e,
+            "remark": merge_node_notes(n.get("remark", ""), port, n["node_id"]),
+        })
+    db.insert_nodes(project_id, nodes, batch_id)
+
+    from services.file_checklist import seed as seed_files
+    counts = seed_files(project_id, country, port, plan, batch_id=batch_id)
+
+    sync_batch_status(batch_id)
+    update_project_status(project_id)
+    try:
+        from services.oplog import record
+        record("batch_edit", project_id, batch_id=batch_id,
+               subject=batch.get("batch_no") or "批次",
+               detail=f"{reason}：按 15 节点标准模板生成计划节点与单证清单"
+                      f"（{len(nodes)} 节点 / {counts['batch']} 批次单证"
+                      f" + {counts['project']} 项目级单证）")
+    except Exception:
+        pass
+    return {"created": True, "nodes": len(nodes),
+            "files": counts["batch"] + counts["project"],
+            "batch_files": counts["batch"], "project_files": counts["project"],
+            "reason": None}

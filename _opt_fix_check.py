@@ -10,7 +10,7 @@ _TMP = tempfile.mkdtemp(prefix="fix_")
 db.DB_PATH = os.path.join(_TMP, "t.db"); db._conn = None; db.init_db()
 
 from services.clock import set_simulated_today
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
 
 pid = DEMO_PROJECT["project_id"]
@@ -24,7 +24,7 @@ for n in DEMO_NODES:
         "role_label": n["role_label"], "seq": n["seq"], "area": n["area"],
         "default_duration": n["duration"], "duration": n["duration"],
         "plan_start": s, "plan_end": e, "remark": n.get("remark", "")}])
-db.insert_files(pid, bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan))
+seed_files(pid, DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
 
 FAILED = []
 def check(c, m):
@@ -44,36 +44,33 @@ from ui.widgets.collapsible import CollapsibleSection
 from ui.pages.dashboard_page import DashboardPage
 from services.node_status import sync_active_projects
 
-# ── 1) 右栏标签状态与内容变更保持 ──
-print("== 1) 右栏默认标签 + 内容变更不改变标签/开合 ==")
+# ── 1) 右栏标签状态与内容变更保持（右栏已迁到甘特工作台） ──
+print("== 1) 工作台右栏默认标签 + 内容变更不改变标签/开合 ==")
 dp = DashboardPage(); dp.resize(1440, 900); dp.show(); dp.refresh(); app.processEvents()
-card = next(dp.list_layout.itemAt(i).widget()
-            for i in range(dp.list_layout.count())
-            if dp.list_layout.itemAt(i).widget()
-            and dp.list_layout.itemAt(i).widget().__class__.__name__ == "ProjectCard")
-card._toggle_expand(); app.processEvents()
-check(card._tab == "files", "默认停在「单证清单」标签")
-check(card._right_collapsed is False, "右栏默认展开")
-check(card._file_panel is not None, "单证面板已构建")
+wb = dp.open_workbench(pid, None, "single"); app.processEvents()
+check(wb._tab == "files", "默认停在「单证清单」标签")
+check(wb._right_collapsed is False, "右栏默认展开")
+check(wb._file_panel is not None, "单证面板已构建")
 
 # 提交一张单证 → 标签与开合状态均不变，且行对象不被销毁
-fp = card._file_panel
+fp = wb._file_panel
 row_before = fp._row_order[0][0]
 fid1 = next(f["file_id"] for f in db.get_files(pid)
             if f.get("node_id") == 1 and f["doc_type"] == "required")
-card._toggle_file(fid1, True); app.processEvents()
-check(card._tab == "files", "提交单证后仍停在「单证清单」标签")
-check(card._right_collapsed is False, "提交单证后右栏保持展开")
-check(card._file_panel is fp and fp._row_order[0][0] is row_before,
+wb._toggle_file(fid1, True); app.processEvents()
+check(wb._tab == "files", "提交单证后仍停在「单证清单」标签")
+check(wb._right_collapsed is False, "提交单证后右栏保持展开")
+check(wb._file_panel is fp and fp._row_order[0][0] is row_before,
       "提交单证后面板/行对象未被重建（卡死根因回归）")
 
 # 收起右栏后再提交另一张 → 仍收起
-card._toggle_right(); app.processEvents()
-check(card._right_collapsed is True, "可收起右栏")
+wb._toggle_right(); app.processEvents()
+check(wb._right_collapsed is True, "可收起右栏")
 fid2 = next(f["file_id"] for f in db.get_files(pid)
             if f["doc_type"] == "required" and f["file_id"] != fid1)
-card._toggle_file(fid2, True); app.processEvents()
-check(card._right_collapsed is True, "收起状态提交单证后不被自动展开")
+wb._toggle_file(fid2, True); app.processEvents()
+check(wb._right_collapsed is True, "收起状态提交单证后不被自动展开")
+wb.close()
 
 # ── 2) 海运压缩表头单调去重 ──
 print("== 2) 海运压缩表头 单调/去重 ==")

@@ -142,6 +142,8 @@ class MainWindow(QMainWindow):
 
         self.home_page = HomePage()
         self.home_page.navigate.connect(self._navigate)
+        self.home_page.open_workbench.connect(self._open_workbench_from_home)
+        self.home_page.open_todo.connect(self._show_today_todo)
         self.stack.addWidget(self.home_page)
 
         self.dashboard_page = DashboardPage()
@@ -199,6 +201,10 @@ class MainWindow(QMainWindow):
         self.tray.activated.connect(lambda reason: self._show_normal() if reason == QSystemTrayIcon.DoubleClick else None)
         self.tray.show()
 
+    def _open_workbench_from_home(self, project_id, batch_id, mode="single"):
+        """启动页点批次行/「全批次总览」→ 直接打开甘特工作台（不切页）。"""
+        self.dashboard_page.open_workbench(project_id, batch_id or None, mode or "single")
+
     def _navigate(self, key):
         self._current_page = key
         if key == "home":
@@ -239,14 +245,18 @@ class MainWindow(QMainWindow):
         today = get_today()
         from services.node_status import sync_active_projects
         sync_active_projects()      # 待办口径一致：先落定「必填齐+已过期末」自动完成
-        total = reminder_svc.badge_count(today=today)
+        data = reminder_svc.compute_reminders_three_level(today=today, enabled_only=True)
+        total = data["badge"]["total"]
+        n_batch = data["totals"].get("batches") or 0
 
         if total == 0:
             color = GREEN
             text = "今日待办 0"
         else:
             color = RED
-            text = f"今日待办 {total}"
+            # §10.5 口径 = 启用中批次待办合计（逐批次相加）。多批次时同时给出批次数，
+            # 让"70 项"这种数字有上下文，不至于看着像重复提醒。
+            text = f"今日待办 {total}" + (f"（{n_batch} 批次）" if n_batch > 1 else "")
         self.todo_badge.setText(f"  {text}  ")
         self.todo_badge.setStyleSheet(
             f"background: {color}; color: #FFFFFF; border-radius: 14px;"

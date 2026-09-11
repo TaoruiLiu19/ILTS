@@ -1,12 +1,22 @@
 """新建页定向校验：字段存在性 / 预览 / 复制模板 / 保存落库(批次+路由+node_key)。"""
-import os, sys
+import os, sys, shutil, tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db
+
+# ★ 隔离临时库（必须在 import services / 建连接之前设置）
+#   本脚本原先直接跑在真实 data/logistics.db 上，且末尾的清理语句写成
+#   `WHERE project_name LIKE '__%'` —— SQLite 里 `_` 是单字符通配符，等价于
+#   "任意 ≥2 字的项目名"，于是会把**真实库里所有项目**连同批次/节点/单证删光。
+#   现改为独立临时库，并把清理条件改成精确匹配自己造的那个项目。
+_TMP = tempfile.mkdtemp(prefix="verify_newpage_")
+db.DB_PATH = os.path.join(_TMP, "t.db")
+db._conn = None
+db.init_db()
+
 from mock_data import seed_demo_project
 from mock_completed import seed_completed_demo
-db.init_db()
 seed_demo_project()
 seed_completed_demo()
 from services.clock import get_today
@@ -106,12 +116,12 @@ if projs:
     cargo = db.get_cargo_items(pid, bid)
     check("货物台账已复制", len(cargo) >= 1, len(cargo))
 
-# 清理测试项目，保证可重复运行
+# 清理测试项目，保证可重复运行（只删自己造的那个：按名称精确匹配，绝不用 LIKE 通配）
 conn = db.get_conn()
 test_pids = [r["project_id"] for r in conn.execute(
-    "SELECT project_id FROM projects WHERE project_name LIKE '__%' ").fetchall()]
+    "SELECT project_id FROM projects WHERE project_name = ?",
+    ("__冒烟批次项目__",)).fetchall()]
 if test_pids:
-    ph = ",".join("?" * len(test_pids))
     for pid in test_pids:
         btds = conn.execute("SELECT batch_id FROM batches WHERE project_id=?", (pid,)).fetchall()
         for b in btds:
@@ -121,8 +131,17 @@ if test_pids:
                 try: conn.execute(f"DELETE FROM {t} WHERE batch_id=?", (bid,))
                 except Exception: pass
             conn.execute("DELETE FROM batches WHERE batch_id=?", (bid,))
-    conn.execute(f"DELETE FROM projects WHERE project_id IN ({ph})", test_pids)
+    conn.execute("DELETE FROM projects WHERE project_id=?", (pid,))
     conn.commit()
     print(f"[cleanup] 删除 {len(test_pids)} 个测试项目")
 
 print("\n===== 新建页校验 %d 项 =====" % len(PASS))
+
+# 收尾：关闭连接并清理临时库（Windows 下文件被占用时静默跳过）
+try:
+    if db._conn is not None:
+        db._conn.close()
+        db._conn = None
+except Exception:
+    pass
+shutil.rmtree(_TMP, ignore_errors=True)

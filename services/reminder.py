@@ -173,9 +173,15 @@ def _mk(level, rtype, msg, project_name, batch=None, pinned=False,
 
 
 def _assign_ids(items):
+    """给条目编号，**跨批次唯一**：`rmd-<批次号>-<序号>`（项目级条目用 `rmd-项目级-<序号>`）。
+
+    旧实现每个批次内部都从 `rmd-1` 重新编号，三个批次的条目拼在一起会出现大量重复 id
+    （实测 70 条里只有 26 个唯一 id）——一旦用 id 做「已读/忽略/勾选」就会串批次。
+    """
     for i, it in enumerate(items, start=1):
         if not it.get("id"):
-            it["id"] = f"rmd-{i}"
+            bn = it.get("batch_no") or ("项目级" if not it.get("batch_id") else "批次")
+            it["id"] = f"rmd-{bn}-{i}"
     return items
 
 

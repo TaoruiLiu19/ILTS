@@ -19,7 +19,7 @@ from services import reporting
 from services import report_exporter
 from services.scheduler import apply_shift, undo_last_shift
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 
 _TMP = tempfile.mkdtemp(prefix="opt_report_")
 db.DB_PATH = os.path.join(_TMP, "r.db")
@@ -61,8 +61,9 @@ def seed_demo():
                       "default_duration": n["duration"], "duration": n["duration"],
                       "plan_start": s, "plan_end": e})
     db.insert_nodes(pid, nodes)
-    files = bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
-    db.insert_files(pid, files)
+    # 批次级 → files；项目级（项目日报等）→ project_files
+    seed_files(pid, DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
+    files = db.get_files(pid)
     return pid
 
 
@@ -79,11 +80,12 @@ check(len(db.get_op_log_all()) == before, "未知 kind 不产生日志（T16）"
 
 print("== 2. 单证同日收敛为一行最终态（T14） ==")
 doc = "商业发票"
-oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
+BID = db.current_batch_id(PID)      # 批次级动作必须带 batch_id（v6.10 收敛键含批次）
+oplog("file_submit", PID, node_id=1, subject=doc, detail="提交", batch_id=BID,
       created_at="2026-09-09 10:00")
-oplog("file_withdraw", PID, node_id=1, subject=doc, detail="撤交",
+oplog("file_withdraw", PID, node_id=1, subject=doc, detail="撤交", batch_id=BID,
       created_at="2026-09-09 11:00")
-oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
+oplog("file_submit", PID, node_id=1, subject=doc, detail="提交", batch_id=BID,
       created_at="2026-09-09 15:00")
 rows = db.get_op_log_range(PID, start="2026-09-09 00:00", end="2026-09-09 23:59")
 mine = [r for r in rows if r["subject"] == doc]
@@ -93,14 +95,14 @@ check(_ts(mine[0]["created_at"]) == "2026-09-09 15:00", "时间戳 = 最后一�
 check(_is_iso08(mine[0]["created_at"]),
       f"§6.6 时间戳为 ISO 8601 +08:00（实际 {mine[0]['created_at']!r}）")
 # 再撤交 → 仍是 1 行，但 kind 变为撤交
-oplog("file_withdraw", PID, node_id=1, subject=doc, detail="撤交",
+oplog("file_withdraw", PID, node_id=1, subject=doc, detail="撤交", batch_id=BID,
       created_at="2026-09-09 16:00")
 mine = [r for r in db.get_op_log_range(PID) if r["subject"] == doc]
 check(len(mine) == 1 and mine[0]["kind"] == "file_withdraw"
       and _ts(mine[0]["created_at"]) == "2026-09-09 16:00",
       "再撤交 → 仍 1 行，覆盖为「撤销 + 16:00」")
 # 跨天保留：次日再提交 → 多一行
-oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
+oplog("file_submit", PID, node_id=1, subject=doc, detail="提交", batch_id=BID,
       created_at="2026-09-10 09:00")
 mine = [r for r in db.get_op_log_range(PID) if r["subject"] == doc]
 check(len(mine) == 2, "跨天各留一行（9/9 撤销 + 9/10 提交）")
@@ -130,7 +132,8 @@ check(m["kind"] == "daily" and m["overview"]["project_count"] >= 1, "日报概�
 check("oper" not in m["title"], "标题不含非法前缀")
 # 单证最新状态板块：每张单证一行，且反映最终态
 states = m["file_states"]
-check(len(states) == len(db.get_files(PID)), "单证最新状态覆盖全部单证")
+check(len(states) == len(db.get_files(PID)) + len(db.get_project_files(PID)),
+      "单证最新状态覆盖全部单证（批次级 + 项目级，项目级只出现一次）")
 blk = reporting.blocks(m)
 check(any(b["t"] == "h" and "单证最新状态" in b["text"] for b in blk),
       "报告含「单证最新状态」板块")

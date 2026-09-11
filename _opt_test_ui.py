@@ -45,7 +45,7 @@ def check(cond, msg):
 
 # ── seed（与 app.seed_demo 等价 + 货物/班轮） ──
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 from services.cargo_check import normalize_item
 from services.scheduler import apply_shift
 
@@ -62,7 +62,7 @@ for n in DEMO_NODES:
                   "default_duration": n["duration"], "duration": n["duration"],
                   "plan_start": s, "plan_end": e, "remark": n.get("remark", "")})
 db.insert_nodes(pid, nodes)
-db.insert_files(pid, bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan))
+seed_files(pid, DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
 db.insert_cargo_items(pid, [
     normalize_item({"item_name": "光伏组件（叠层）", "qty": 20, "unit": "套",
                     "dim_l": 2.3, "dim_w": 1.1, "dim_h": 0.4, "weight_kg": 1200}),
@@ -132,16 +132,16 @@ card = cards[0]
 check("超限" in card.cargo_label.text(), "卡片头显示货物/超限微统计")
 check("COSCO" in card.vessel_label.text(), "卡片头显示船名")
 
-print("\n== 动态调整面板 + 卡片位移 ==")
-card._toggle_expand()
+print("\n== 动态调整面板 + 工作台位移 ==")
+wb = dp_page.open_workbench(pid, None, "single")
 app.processEvents()
-check(card.expand_area.isVisible(), "展开卡片")
-card._step_spin.setValue(1)
+check(wb.isVisible(), "甘特工作台已打开（卡片不再折叠）")
+wb._step_spin.setValue(1)
 _oversea_before = {n["node_id"]: n["plan_start"] for n in db.get_nodes(pid)
                    if n["node_id"] in OVERSEA_IDS}
-card._shift_node(FIRST_OVERSEA, 1)   # 境外首节点 推迟 1 天（成功路径，不弹窗）
+wb._shift_node(FIRST_OVERSEA, 1)   # 境外首节点 推迟 1 天（成功路径，不弹窗）
 app.processEvents()
-check(card._op_note and "推迟" in card._op_note.text(), "位移操作提示已刷新")
+check(wb._op_note and "推迟" in wb._op_note.text(), "位移操作提示已刷新")
 from services.clock import get_today
 eta = db.get_project(pid)["eta"]
 check(eta == DEMO_PROJECT["eta"], "境外节点+1 不影响 ETA")

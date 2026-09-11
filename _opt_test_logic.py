@@ -20,7 +20,7 @@ from services.scheduler import apply_shift, undo_last_shift, ShiftError
 from services.cargo_check import normalize_item, item_over_types, summary
 from services.vessel_status import fetch_latest_status, register_manual_position
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 from services import node_template as nt
 
 # ── 节点分区（按 node_key/area，禁止硬编码 node_id —— D20/§5.2） ──
@@ -67,8 +67,7 @@ def seed_demo():
             "default_duration": n["duration"], "duration": n["duration"],
             "plan_start": s, "plan_end": e, "remark": n.get("remark", "")})
     db.insert_nodes(pid, nodes)
-    db.insert_files(pid, bootstrap(DEMO_PROJECT["country"],
-                                   DEMO_PROJECT["export_port"], plan))
+    seed_files(pid, DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
     return pid
 
 

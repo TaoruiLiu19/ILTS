@@ -11,7 +11,7 @@ _TMP = tempfile.mkdtemp(prefix="conv_")
 db.DB_PATH = os.path.join(_TMP, "t.db"); db._conn = None; db.init_db()
 
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 pid = DEMO_PROJECT["project_id"]
 plan = get_demo_schedule()
 db.insert_project({**{k: DEMO_PROJECT[k] for k in
@@ -23,7 +23,7 @@ for n in DEMO_NODES:
                   "seq":n["seq"],"area":n["area"],"default_duration":n["duration"],
                   "duration":n["duration"],"plan_start":s,"plan_end":e,"remark":n.get("remark","")})
 db.insert_nodes(pid,nodes)
-db.insert_files(pid,bootstrap(DEMO_PROJECT["country"],DEMO_PROJECT["export_port"],plan))
+seed_files(pid,DEMO_PROJECT["country"],DEMO_PROJECT["export_port"],plan)
 
 from services.oplog import record
 from services.reporting import activity_daily, _converge_file_ops

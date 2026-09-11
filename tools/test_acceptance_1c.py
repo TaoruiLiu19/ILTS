@@ -37,7 +37,7 @@ from services import report_exporter                        # noqa: E402
 from services import batches as batches_svc                 # noqa: E402
 from services import schedule2                              # noqa: E402
 from services.schedule_change import apply as sc_apply      # noqa: E402
-from services.file_checklist import bootstrap               # noqa: E402
+from services.file_checklist import seed as seed_files       # noqa: E402
 from services.node_template import template as node_template  # noqa: E402
 
 FAILED = []
@@ -78,7 +78,7 @@ def seed_project(etd="2026-09-15", eta="2026-10-26", name="青岛→巴西Sepeti
     for n in nodes:
         n["plan_start"], n["plan_end"] = plan[n["node_key"]]
     db.insert_nodes(pid, nodes, bid)
-    db.insert_files(pid, bootstrap("BR", "QD", plan), bid)
+    seed_files(pid, "BR", "QD", plan, bid)
     db.update_batch(bid, status="ready")
     batches_svc.update_project_status(pid)
     return pid, bid

@@ -566,7 +566,7 @@ class TodayTodoDialog(QDialog):
             body_lay.addSpacing(4)
             body_lay.addLayout(gh)
             for r in items:
-                body_lay.addWidget(self._row_card(r["project"], r["msg"]))
+                body_lay.addWidget(self._row_card(r))
 
         if not has_any:
             empty_lbl = QLabel("今日暂无待办，一切正常")
@@ -656,7 +656,12 @@ class TodayTodoDialog(QDialog):
     def dependency_waiting_texts(self):
         return self._dep_view.waiting_texts() if hasattr(self, "_dep_view") else []
 
-    def _row_card(self, project, msg):
+    def _row_card(self, r):
+        """待办卡片：标题行显示「项目 · 批次」，**多批次下同名单证不再长得一模一样**。
+
+        v6.10：行内必须带批次——三个批次各自都有一份《出口报关单》，
+        旧实现只显示项目名，用户无法分辨该去哪个批次补交。
+        """
         from ui.theme import CARD, BORDER, TEXT_PRIMARY, TEXT_SECONDARY
         card = QFrame()
         card.setStyleSheet(
@@ -665,11 +670,19 @@ class TodayTodoDialog(QDialog):
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 9, 14, 9)
         v.setSpacing(3)
-        pj = QLabel(project)
+        project = r.get("project") or ""
+        batch_no = r.get("batch_no") or ""
+        if batch_no:
+            title = f"{project} · {batch_no}"
+        elif not r.get("batch_id"):
+            title = f"{project} · 项目级" if project else "项目级"
+        else:
+            title = project
+        pj = QLabel(title)
         pj.setStyleSheet(
             f"font-size: 12px; font-weight: 600; color: {TEXT_SECONDARY};")
         v.addWidget(pj)
-        msg_lbl = QLabel(msg)
+        msg_lbl = QLabel(r.get("msg") or "")
         msg_lbl.setWordWrap(True)
         msg_lbl.setStyleSheet(f"font-size: 13px; color: {TEXT_PRIMARY};")
         v.addWidget(msg_lbl)

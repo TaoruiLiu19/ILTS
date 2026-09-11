@@ -13,7 +13,7 @@ db.init_db()
 from datetime import date
 from services.clock import set_simulated_today, reset
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 
 pid = DEMO_PROJECT["project_id"]
 plan = get_demo_schedule()
@@ -28,7 +28,7 @@ for n in DEMO_NODES:
                   "default_duration": n["duration"], "duration": n["duration"],
                   "plan_start": s, "plan_end": e, "remark": n.get("remark", "")})
 db.insert_nodes(pid, nodes)
-db.insert_files(pid, bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan))
+seed_files(pid, DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
 
 from PySide6.QtWidgets import QApplication
 app = QApplication(sys.argv)
@@ -51,12 +51,13 @@ app.processEvents()
 card = [page.list_layout.itemAt(i).widget() for i in range(page.list_layout.count())
         if page.list_layout.itemAt(i).widget() is not None
         and page.list_layout.itemAt(i).widget().__class__.__name__ == "ProjectCard"][0]
-card._toggle_expand()
+wb = page.open_workbench(pid, None, "single")
 app.processEvents()
+check_card = card  # 卡片保留用于对照（摘要不再折叠）
 
 fid = db.get_files(pid)[0]["file_id"]
 doc = db.get_files(pid)[0]["doc_name"]
-card._toggle_file(fid, True)
+wb._toggle_file(fid, True)
 app.processEvents()
 
 rows = [r for r in db.get_op_log_range(pid) if r["kind"] == "file_submit"]
@@ -79,7 +80,7 @@ check(f["submitted_date"] == "2026-12-25",
       f"单证 submitted_date 也跟随模拟日期（{f['submitted_date']}）")
 
 # 行内状态同步
-row = card._file_panel._rows.get(fid)
+row = wb._file_panel._rows.get(fid)
 check(row is not None and row.status_label.text().startswith("已提交"),
       "界面行状态已同步为「已提交」")
 

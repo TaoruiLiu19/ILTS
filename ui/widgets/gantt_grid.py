@@ -22,7 +22,7 @@ from services.node_template import LASHING, BUFFER_HINT
 from ui.theme import (
     AREA_COLORS, AREA_TEXT, AREA_FG, NODE_STATUS_COLORS, get_role_color,
     GRAY_SOFT, HAIRLINE, TEXT_SECONDARY, TEXT_PRIMARY, TEXT_TERTIARY,
-    ACCENT, ORANGE, RED, GREEN, YELLOW, WAITING_YELLOW
+    ACCENT, ORANGE, RED, GREEN, YELLOW, WAITING_YELLOW, BORDER
 )
 
 NAME_W = 170
@@ -31,6 +31,11 @@ ROW_HEIGHT = 45
 HEADER_H = 24
 BANNER_H = 32
 SEA_MAX_COLS = 5          # 海运压缩后最多占用的列数
+EMPTY_BODY_H = 132        # 无节点（空批次）时占位区高度 —— 绝不允许高度为 0
+EMPTY_MIN_COLS = 6        # 空批次占位画布的最小列数（保证提示文案有宽度）
+EMPTY_TITLE = "该批次还没有计划节点"
+EMPTY_HINTS = ("在「批次管理」确认 ETD / ETA 后保存，",
+               "将按 15 节点标准模板自动生成计划节点与单证清单。")
 GOLD = "#E8A50C"          # 今日标注 · 金色
 GOLD_BG = "#FFF4D6"       # 今日表头 · 浅金底
 DIVIDER = "#AEB5C3"       # 三条区域之间的分隔竖线
@@ -47,13 +52,16 @@ def _parse(s):
 
 
 class _GanttCanvas(QWidget):
-    def __init__(self, nodes, today, export_port, over_count=0, buffer_days=4, parent=None):
+    def __init__(self, nodes, today, export_port, over_count=0, buffer_days=4,
+                 empty_title=None, empty_hints=None, parent=None):
         super().__init__(parent)
         self._nodes = nodes
         self._today = today
         self._export_port = export_port
         self._over_count = over_count or 0
         self._buffer_days = buffer_days or 4
+        self._empty_title = empty_title or EMPTY_TITLE
+        self._empty_hints = tuple(empty_hints) if empty_hints else EMPTY_HINTS
         self._row_tags = {}         # node_id -> [(text, color), ...]
         self._dep_waiting = {}      # node_key -> 上游文案（§10.5 依赖标黄）
         self._bottleneck_id = None
@@ -65,6 +73,7 @@ class _GanttCanvas(QWidget):
         self._sea_ranges = []       # 海运压缩列的时间跨距 (delta_start, delta_end)
         self._sea_compressed = False
         self._port = None
+        self._empty = not nodes      # 空批次（无节点）→ 走占位绘制
         self._w = NAME_W
         self._h = 0
         self._banner_h = 0
@@ -76,13 +85,29 @@ class _GanttCanvas(QWidget):
         self.setMinimumSize(self._w, self._h)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setMouseTracking(True)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setCursor(Qt.ArrowCursor if self._empty else Qt.PointingHandCursor)
 
     # ── 列模型构建 ──
     def _compute(self):
         nodes = self._nodes
         if not nodes:
+            # 空批次（新增批次尚未生成节点）：给出真实的占位高度，
+            # 否则 auto_height() 返回 0 → 看板 setFixedHeight(0) → 甘特整块消失。
+            from config import get_port
+            self._empty = True
+            self._port = get_port(self._export_port)
+            self._banner_h = BANNER_H if self._port else 0
+            self._w = NAME_W + EMPTY_MIN_COLS * COL_WIDTH
+            self._h = self._banner_h + HEADER_H * 2 + EMPTY_BODY_H
+            self._col_dates = []
+            self._col_area = []
+            self._areas = {}
+            self._today_idx = None
+            self._sea_labels = []
+            self._sea_ranges = []
+            self._row_tags = {}
             return
+        self._empty = False
 
         by_area = {a: [n for n in nodes if n["area"] == a] for a in AREA_ORDER}
         dome_nodes = by_area["DOME"]
@@ -322,6 +347,9 @@ class _GanttCanvas(QWidget):
         p.fillRect(self.rect(), QColor("#FFFFFF"))
 
         if not self._nodes:
+            # 空批次：画表头骨架 + 占位提示（不再整块空白/零高度）
+            self._draw_banner(p)
+            self._draw_empty(p)
             return
 
         self._draw_banner(p)
@@ -330,6 +358,43 @@ class _GanttCanvas(QWidget):
         self._draw_rows(p)
         self._draw_dividers(p)
         self._draw_hover(p)
+
+    def _draw_empty(self, p):
+        """空批次占位：保留表头骨架，居中说明「下一步该做什么」。"""
+        top = self._region_top()
+        p.fillRect(QRectF(0, top, NAME_W, HEADER_H), QColor(GRAY_SOFT))
+        p.setPen(QColor(TEXT_SECONDARY))
+        f = QFont("Microsoft YaHei UI", 8)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(0, top, NAME_W, HEADER_H), Qt.AlignCenter, "节点 / 角色")
+
+        htop = self._header_top()
+        p.fillRect(QRectF(0, htop, self._w, HEADER_H), QColor("#FAFAFC"))
+        p.setPen(QColor(HAIRLINE))
+        p.drawLine(0, htop + HEADER_H - 1, self._w, htop + HEADER_H - 1)
+
+        body_top = self._node_top()
+        box = QRectF(12, body_top + 10, max(80, self._w - 24), EMPTY_BODY_H - 20)
+        p.setPen(QPen(QColor(BORDER), 1, Qt.DashLine))
+        p.setBrush(QBrush(QColor("#FAFAFC")))
+        p.drawRoundedRect(box, 12, 12)
+
+        ft = QFont("Microsoft YaHei UI", 10)
+        ft.setBold(True)
+        fh = QFont("Microsoft YaHei UI", 8)
+        inner_w = max(40, int(box.width()) - 16)
+
+        rows = [(self._empty_title, ft, TEXT_PRIMARY, 26)]
+        for h in self._empty_hints:
+            rows.append((h, fh, TEXT_TERTIARY, 18))
+        y = box.center().y() - sum(r[3] for r in rows) / 2.0
+        for text, font, color, lh in rows:
+            p.setFont(font)
+            p.setPen(QColor(color))
+            p.drawText(QRectF(box.left() + 8, y, inner_w, lh), Qt.AlignCenter,
+                       QFontMetrics(font).elidedText(text, Qt.ElideRight, inner_w))
+            y += lh
 
     # ── 悬停联动 ──
 
@@ -587,14 +652,15 @@ class GanttGrid(ScopedScrollArea):
     nodeActivated = Signal(object)  # 左键单击某行: node dict
 
     def __init__(self, nodes, today=None, readonly=False, export_port=None,
-                 over_count=0, buffer_days=4, parent=None):
+                 over_count=0, buffer_days=4, empty_title=None, empty_hints=None, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(False)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._readonly = readonly
         self._canvas = _GanttCanvas(nodes, today or get_today(), export_port,
-                                    over_count=over_count, buffer_days=buffer_days)
+                                    over_count=over_count, buffer_days=buffer_days,
+                                    empty_title=empty_title, empty_hints=empty_hints)
         self._canvas._hover_cb = lambda n: self.nodeHovered.emit(n)
         if not readonly:
             self._canvas._activate_cb = lambda n: self.nodeActivated.emit(n)

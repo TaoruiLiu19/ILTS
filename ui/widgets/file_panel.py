@@ -56,7 +56,7 @@ class FileRow(QFrame):
     dep（可选）= {"blocked": bool, "text": "待上游：《MBL》", ...} → 整行标灰。
     """
 
-    toggled = Signal(int, bool)
+    toggled = Signal(object, bool)      # file_id 可能是整数（批次单证）或 'pf-<n>'（项目级单证）
 
     def __init__(self, file_data, node_status=None, today=None, readonly=False,
                  dep=None, parent=None):
@@ -213,7 +213,7 @@ class FileRow(QFrame):
 class FilePanel(ScopedScrollArea):
     """单证清单面板 + 甘特联动支持（focus_node / scroll_to_node）+ §10.3 依赖标灰"""
 
-    file_toggled = Signal(int, bool)
+    file_toggled = Signal(object, bool)  # 同上：兼容项目级单证的 'pf-<n>' 字符串 id
     FOCUS_BG = "#EAF3FF"     # 悬停/选中节点时对应单证行的浅蓝底
 
     def __init__(self, files, nodes=None, today=None, readonly=False, parent=None,

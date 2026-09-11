@@ -11,7 +11,7 @@ db._conn = None
 db.init_db()
 
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
-from services.file_checklist import bootstrap
+from services.file_checklist import seed as seed_files
 
 pid = DEMO_PROJECT["project_id"]
 plan = get_demo_schedule()
@@ -25,7 +25,7 @@ for n in DEMO_NODES:
                   "default_duration": n["duration"], "duration": n["duration"],
                   "plan_start": s, "plan_end": e, "remark": n.get("remark", "")})
 db.insert_nodes(pid, nodes)
-db.insert_files(pid, bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan))
+seed_files(pid, DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
 
 # ── D32 提交前置：客户角色 + 目的国税号 ──
 # 勾选单证会走真实提交链路；资料不齐时产品会弹「客户资料缺失/税号缺失」模态框，
@@ -76,7 +76,7 @@ app.processEvents()
 card = [page.list_layout.itemAt(i).widget() for i in range(page.list_layout.count())
         if page.list_layout.itemAt(i).widget() is not None
         and page.list_layout.itemAt(i).widget().__class__.__name__ == "ProjectCard"][0]
-card._toggle_expand()
+wb = page.open_workbench(pid, None, "single")
 app.processEvents()
 
 FAILED = []
@@ -88,9 +88,9 @@ def check(cond, msg):
         FAILED.append(msg)
 
 
-fp = card._file_panel
+fp = wb._file_panel
 rows = [r for r, _ in fp._row_order]
-print(f"文件行数 = {len(rows)}  节点数 = {len(card._nodes)}")
+print(f"文件行数 = {len(rows)}  节点数 = {len(wb._nodes)}")
 
 # 前置：D32 校验已满足 → 勾选会走「提交成功」分支而非弹窗阻断
 from services import batches as _bsvc

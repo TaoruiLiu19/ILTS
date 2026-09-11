@@ -7,7 +7,7 @@
 
 from services.node_template import template as _template
 from services import schedule2
-from services.file_checklist import bootstrap
+from services.file_checklist import bootstrap, seed as fc_seed
 
 
 # 进行中演示项目
@@ -71,12 +71,18 @@ def build_project(project, complete=False):
             n["actual_completion_date"] = None
     db.insert_nodes(pid, nodes, batch["batch_id"])
 
-    files = bootstrap(project["country"], project["export_port"], plan)
+    # 单证清单：批次级（票货）写 files，项目级（项目日报等）写 project_files（同项目一份）
+    counts = fc_seed(pid, project["country"], project["export_port"], plan,
+                     batch["batch_id"])
+    files = db.get_files_by_batch(batch["batch_id"])
+    proj_files = db.get_project_files(pid)
     if complete:
         for f in files:
-            f["status"] = "submitted"
-            f["submitted_date"] = f.get("due_date") or project["eta"]
-    db.insert_files(pid, files, batch["batch_id"])
+            db.update_file(f["file_id"], status="submitted",
+                           submitted_date=f.get("due_date") or project["eta"])
+        for f in proj_files:
+            db.update_project_file(f["file_id"], status="submitted",
+                                   submitted_date=project["eta"])
 
     if complete:
         db.update_batch(batch["batch_id"],
@@ -92,7 +98,8 @@ def build_project(project, complete=False):
         db.update_project(pid, status="Active")
 
     return {"project_id": pid, "batch_id": batch["batch_id"],
-            "nodes": len(nodes), "files": len(files)}
+            "nodes": len(nodes), "files": counts["batch"] + counts["project"],
+            "batch_files": counts["batch"], "project_files": counts["project"]}
 
 
 def seed_demo_project():
