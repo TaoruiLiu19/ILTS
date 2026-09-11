@@ -20,6 +20,7 @@ from ui.pages.new_project_page import NewProjectPage
 from ui.pages.completed_page import CompletedPage
 from ui.pages.report_page import ReportPage
 from services.reminder import compute_reminders, count_total
+from services import reminder as reminder_svc
 
 
 NAV_ITEMS = [
@@ -128,7 +129,10 @@ class MainWindow(QMainWindow):
         self.todo_badge = QLabel()
         self.todo_badge.setCursor(Qt.PointingHandCursor)
         self.todo_badge.setFixedHeight(28)
-        self.todo_badge.mousePressEvent = lambda e: self._show_today_todo()
+        self.todo_badge.setToolTip("点击查看今日待办；右键或使用托盘菜单进入「提醒中心」")
+        self.todo_badge.mousePressEvent = lambda e: (
+            self._show_reminder_center()
+            if e.button() == Qt.RightButton else self._show_today_todo())
         tb_layout.addWidget(self.todo_badge)
 
         right_layout.addWidget(topbar)
@@ -180,6 +184,11 @@ class MainWindow(QMainWindow):
         action_todo.triggered.connect(self._show_today_todo)
         menu.addAction(action_todo)
 
+        # §12.4 提醒中心（按批次分组：免箱期/到货通知/申报截止/依赖等待）
+        action_center = QAction("提醒中心", self)
+        action_center.triggered.connect(self._show_reminder_center)
+        menu.addAction(action_center)
+
         menu.addSeparator()
 
         action_quit = QAction("退出", self)
@@ -221,16 +230,16 @@ class MainWindow(QMainWindow):
         self._update_todo_badge()
 
     def _update_todo_badge(self):
+        """§10.5 徽标口径 = **启用中批次待办合计**（draft/ready/running）。
+
+        旧实现按项目取 `db.get_files(proj_id)`（无 batch_id → 只取当前批次）逐级求和，
+        既漏掉同项目其他启用批次，也会把已关闭批次的单证算进去。现改为按批次聚合：
+        每个启用批次各算一次提醒（含免箱期/到货通知/申报截止/依赖等待），再合计。
+        """
         today = get_today()
         from services.node_status import sync_active_projects
         sync_active_projects()      # 待办口径一致：先落定「必填齐+已过期末」自动完成
-        projects = db.get_projects_by_status("Active")
-        total = 0
-        for proj in projects:
-            nodes = db.get_nodes(proj["project_id"])
-            files = db.get_files(proj["project_id"])
-            reminders = compute_reminders(proj, nodes, files, today)
-            total += count_total(reminders)
+        total = reminder_svc.badge_count(today=today)
 
         if total == 0:
             color = GREEN
@@ -318,24 +327,37 @@ class MainWindow(QMainWindow):
         self._navigate(self._current_page)
 
     def _show_today_todo(self):
+        """今日待办弹窗：按启用中批次聚合（§10.5 同一口径）。"""
         today = get_today()
         from services.node_status import sync_active_projects
         sync_active_projects()
-        projects = db.get_projects_by_status("Active")
         all_reminders = {"P0": [], "P1": [], "P2": []}
-        for proj in projects:
-            nodes = db.get_nodes(proj["project_id"])
-            files = db.get_files(proj["project_id"])
-            reminders = compute_reminders(proj, nodes, files, today)
-            for level in all_reminders:
-                all_reminders[level].extend(reminders[level])
+        batch_ids = []
+        for proj in db.get_projects_by_status("Active"):
+            for b in db.get_batches(proj["project_id"]):
+                if b["status"] not in reminder_svc.ENABLED_STATES:
+                    continue
+                batch_ids.append(b["batch_id"])
+                for r in reminder_svc.compute_reminders_for_batch(b["batch_id"], today):
+                    all_reminders.setdefault(r["level"], []).append(r)
 
         total = count_total(all_reminders)
 
         if total > 0:
             from ui.dialogs import TodayTodoDialog
-            TodayTodoDialog(all_reminders, today, self).exec()
+            TodayTodoDialog(all_reminders, today, self,
+                            batch_ids=batch_ids).exec()
             self.tray.showMessage("今日待办", f"共 {total} 项待办", QSystemTrayIcon.Information)
+
+    def _show_reminder_center(self):
+        """§12.4 提醒中心（按批次分组：免箱期倒计时/到货通知/申报截止/依赖等待）。"""
+        today = get_today()
+        from services.node_status import sync_active_projects
+        sync_active_projects()
+        from ui.widgets.reminder_center import ReminderCenterDialog
+        dlg = ReminderCenterDialog(today=today, parent=self)
+        dlg.exec()
+        self._update_todo_badge()
 
     def _show_toast(self, msg):
         self.tray.showMessage("操作完成", msg, QSystemTrayIcon.Information)

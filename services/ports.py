@@ -89,15 +89,26 @@ def list_tree():
 
 
 def list_ports():
-    """返回全部港口条目（平铺）。"""
-    return list(ports_cn.all_ports())
+    """返回全部港口条目（平铺，含注入的 port_timezone_offset）。"""
+    return [_with_tz(p) for p in ports_cn.all_ports()]
 
 
 # ── 查询 ──
 
 def get_port(key):
-    """兼容 config.get_port：返回港口条目 dict 或 None。"""
-    return ports_cn.get_entry(key)
+    """兼容 config.get_port：返回港口条目 dict 或 None（含 port_timezone_offset）。"""
+    return _with_tz(ports_cn.get_entry(key))
+
+
+def _with_tz(p):
+    """§6.6 D21：为港口条目补 port_timezone_offset（仅提示，不参与计算）。
+    国内海港全部 UTC+8；生成文件 ports_cn.py 不再改动。"""
+    if not p:
+        return p
+    if "port_timezone_offset" not in p:
+        p = dict(p)
+        p["port_timezone_offset"] = 8
+    return p
 
 
 def platform_note(key, node_id):

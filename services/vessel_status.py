@@ -31,7 +31,15 @@ class ManualProvider(VesselStatusProvider):
         import db
         if not vessel:
             return None
-        rows = db.get_vessel_positions(vessel["project_id"], limit=1)
+        # vessel 为批次级记录：project_id 可能不在行内，按 batch_id 反解（§6.7）
+        project_id = vessel.get("project_id")
+        batch_id = vessel.get("batch_id")
+        if not project_id and batch_id:
+            b = db.get_batch(batch_id)
+            project_id = b["project_id"] if b else None
+        if not project_id:
+            return None
+        rows = db.get_vessel_positions(project_id, limit=1, batch_id=batch_id)
         if not rows:
             return None
         pos = rows[0]
@@ -59,9 +67,9 @@ def fetch_latest_status(vessel):
 
 
 def register_manual_position(project_id, lat=None, lon=None,
-                             actual_eta=None, note=None):
+                             actual_eta=None, note=None, batch_id=None):
     """操作员人工登记一条船位动态（写入本地 vessel_positions 以便回放）"""
     import db
     db.insert_vessel_position(project_id, lat=lat, lon=lon,
-                              actual_eta=actual_eta, note=note)
-    return db.get_vessel(project_id)
+                              actual_eta=actual_eta, note=note, batch_id=batch_id)
+    return db.get_vessel(project_id, batch_id=batch_id)

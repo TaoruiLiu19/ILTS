@@ -32,6 +32,12 @@ def _fmt(dt):
     return dt.strftime("%Y-%m-%d")
 
 
+def _guard_batch_writable(batch_id):
+    """§8：已取消批次禁止任何写入（位移属写入）。"""
+    import db
+    db.assert_batch_writable(batch_id)
+
+
 # ── 基础排程（建项目时跑一次） ──
 
 def generate_schedule(etd, eta, nodes_cfg):
@@ -99,9 +105,11 @@ def _sea_duration(sea):
     return (_parse(sea["plan_end"]) - _parse(sea["plan_start"])).days
 
 
-def shift_node(nodes, from_node_id, days, today=None):
+def shift_node(nodes, from_node_id, days, today=None, allow_past=False):
     """
     days > 0 推迟；days < 0 提前。
+    allow_past=True 供「撤销位移」使用：撤销是还原一个此前已被接受的计划，
+    不得被「提前不早于今日」守卫拦住（否则原计划贴近今日时永远撤不回来）。
     返回 (updated_nodes, new_etd, new_eta, affected_node_ids)
     """
     days = int(days)
@@ -131,7 +139,8 @@ def shift_node(nodes, from_node_id, days, today=None):
 
     def _finish(win, etd_node, eta_node):
         """统一收尾：守卫 → 净位移记账 → 返回"""
-        _guard_past(win, days, today, orig_start)
+        if not allow_past:
+            _guard_past(win, days, today, orig_start)
         _guard_collision(win, days, today)
         for n in win:
             n["delay_days"] = n.get("delay_days", 0) + days
@@ -210,26 +219,31 @@ def shift_node(nodes, from_node_id, days, today=None):
 
 # ── 高层服务：位移 → 全链路落库（nodes / project / shift_history / files due） ──
 
-def apply_shift(project_id, from_node_id, days, oplog=True):
+def apply_shift(project_id, from_node_id, days, oplog=True, batch_id=None, allow_past=False):
     """
-    对项目执行一次位移并落库：
+    对项目（指定批次）执行一次位移并落库：
       1) shift_node 计算（含四守卫）
       2) 回写 nodes.plan_start/plan_end/duration/delay_days/is_delayed
-      3) 回写 projects.etd/eta（ETA 联动）
+      3) 回写 projects.etd/eta（ETA 联动，兼容字段）
       4) 写入 shift_history（可撤销留痕）
       5) 单证 due_date 跟随重算（锚 node_start/node_end）
     oplog=False 供撤销调用：撤销自身不再记 node_shift（由调用方记 node_unshift）。
+    batch_id：批次上下文（§6.7 凡节点/单证/位移操作必须显式带 batch_id）。
     返回结果 dict；守卫拦截时抛 ShiftError（不产生任何写入）。
     """
     import db
     project = db.get_project(project_id)
     if not project:
         raise ShiftError("项目不存在")
-    nodes = db.get_nodes(project_id)
-    updated, new_etd, new_eta, affected = shift_node(nodes, from_node_id, days)
+    batch_id = db._resolve_batch(project_id, batch_id)
+    _guard_batch_writable(batch_id)
+    nodes = db.get_nodes_by_batch(batch_id)
+    updated, new_etd, new_eta, affected = shift_node(nodes, from_node_id, days,
+                                                     allow_past=allow_past)
+    node_keys = {n["node_id"]: n["node_key"] for n in nodes}
 
     for n in updated:
-        db.update_node(project_id, n["node_id"],
+        db.update_node(project_id, n["node_id"], batch_id=batch_id,
                        plan_start=n["plan_start"],
                        plan_end=n["plan_end"],
                        duration=n.get("duration", 0),
@@ -239,21 +253,23 @@ def apply_shift(project_id, from_node_id, days, oplog=True):
 
     from services.clock import get_now_str
     created_at = get_now_str("%Y-%m-%d %H:%M:%S.%f")  # 微秒级：保证同组/同秒可区分
-    db.insert_shift_history(project_id, affected, int(days), created_at)
+    db.insert_shift_history(project_id, affected, int(days), created_at,
+                            batch_id=batch_id, node_keys=node_keys)
 
     # 操作日志埋点（node_shift 主动调整）
     if oplog:
         try:
             from services.oplog import record as oplog_record
             oplog_record(
-                "node_shift", project_id, node_id=from_node_id, subject=f"节点{from_node_id}",
+                "node_shift", project_id, batch_id=batch_id, node_id=from_node_id,
+                node_key=node_keys.get(from_node_id), subject=f"节点{from_node_id}",
                 detail=f"{'推迟' if days > 0 else '提前'} {abs(days)} 天 · 影响 {len(affected)} 个节点",
                 delta=int(days))
         except Exception:
             pass  # 日志失败不影响位移主流程
 
-    plan = {n["node_id"]: (n["plan_start"], n["plan_end"]) for n in updated}
-    due_changed = db.recompute_files_due(project_id, plan)
+    plan = {n["node_key"]: (n["plan_start"], n["plan_end"]) for n in updated}
+    due_changed = db.recompute_files_due(project_id, plan, batch_id=batch_id)
 
     return {
         "project_id": project_id,
@@ -268,25 +284,30 @@ def apply_shift(project_id, from_node_id, days, oplog=True):
     }
 
 
-def undo_last_shift(project_id):
+def undo_last_shift(project_id, batch_id=None):
     """
     撤销最近一次位移：取 shift_history 最近一组（同 created_at），
     以组内最小 node_id 为起始节点反向位移 -delta。
     返回结果 dict；无历史或撤销被守卫拦截时抛 ShiftError。
     """
     import db
-    group = db.last_shift_group(project_id)
+    batch_id = db.resolve_batch_optional(project_id, batch_id)
+    if not batch_id:
+        raise ShiftError("暂无位移历史可撤销")
+    group = db.last_shift_group(project_id, batch_id=batch_id)
     if not group:
         raise ShiftError("暂无位移历史可撤销")
     delta = group[0]["delta"]
     undone_id = min(r["id"] for r in group)
     from_node = min(r["node_id"] for r in group)
     # 撤销自身不再记 node_shift；由下方单独记 node_unshift（带 shift_history 主键）
-    res = apply_shift(project_id, from_node, -delta, oplog=False)
+    res = apply_shift(project_id, from_node, -delta, oplog=False, batch_id=batch_id,
+                      allow_past=True)
     try:
         from services.oplog import record as oplog_record
         oplog_record(
             "node_unshift", project_id, node_id=from_node, subject=f"节点{from_node}",
+            batch_id=batch_id,
             detail=f"撤销位移 #{undone_id}（恢复至原计划）")
     except Exception:
         pass

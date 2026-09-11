@@ -14,10 +14,12 @@ from PySide6.QtGui import QPixmap
 import db
 from ui.theme import (
     GLOBAL_QSS, card_shadow, ACCENT, GREEN, RED, ORANGE,
-    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY, BORDER, HAIRLINE, GRAY_SOFT
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY, BORDER, HAIRLINE, GRAY_SOFT,
+    CANCELLED, CANCELLED_SOFT
 )
 from ui.icons import tile_pixmap, pixmap
 from services.reminder import compute_reminders, count_total
+from services import reminder as RNSVC
 
 
 class EntryCard(QFrame):
@@ -141,10 +143,17 @@ class HomePage(QWidget):
                                      "doc", ACCENT, "#EAF3FF", grid_wrap)
         self.card_report.clicked.connect(lambda k: self.navigate.emit(k))
 
+        # §8/D30/T32：全部批次被取消的项目 → 项目状态「Cancelled」，**留在列表**并标注
+        # 「已取消」，但不进「已完成」页；启动页单列一张灰卡，避免此类项目无入口而“消失”。
+        self.card_cancelled = EntryCard("dashboard", "已取消", "", 0,
+                                        "folder", CANCELLED, CANCELLED_SOFT, grid_wrap)
+        self.card_cancelled.clicked.connect(lambda k: self.navigate.emit(k))
+
         cards_grid.addWidget(self.card_active, 0, 0)
         cards_grid.addWidget(self.card_completed, 0, 1)
         cards_grid.addWidget(self.card_new, 1, 0)
         cards_grid.addWidget(self.card_report, 1, 1)
+        cards_grid.addWidget(self.card_cancelled, 2, 0)
         cards_grid.setColumnStretch(0, 1)
         cards_grid.setColumnStretch(1, 1)
         grid_wrap.setLayout(cards_grid)
@@ -170,13 +179,26 @@ class HomePage(QWidget):
     def refresh(self):
         active_count = db.count_projects("Active")
         completed_count = db.count_projects("Completed")
+        cancelled_count = db.count_projects("Cancelled")
 
-        self.card_active.update_count(active_count, f"当前跟踪 {active_count} 个项目")
+        sub = f"当前跟踪 {active_count} 个项目"
+        if cancelled_count:
+            sub += f" · 已取消 {cancelled_count}"
+        self.card_active.update_count(active_count, sub)
         self.card_completed.update_count(completed_count, f"归档 {completed_count} 个项目")
+        self.card_cancelled.update_count(
+            cancelled_count,
+            "全部批次已取消，留在列表可查（不进「已完成」页）"
+            if cancelled_count else "暂无全部批次被取消的项目")
 
         self._refresh_reminders()
 
     def _refresh_reminders(self):
+        """§10.5 徽标口径 = 启用中批次待办合计（draft/ready/running）。
+
+        旧实现只取「当前批次」（`db.get_files(proj_id)` 无 batch_id），同项目其他
+        启用批次会被漏算；现按批次逐级聚合。
+        """
         today = get_today()
         from services.node_status import sync_active_projects
         sync_active_projects()
@@ -185,15 +207,16 @@ class HomePage(QWidget):
         todo_lines = []
 
         for proj in projects:
-            nodes = db.get_nodes(proj["project_id"])
-            files = db.get_files(proj["project_id"])
-            reminders = compute_reminders(proj, nodes, files, today)
-            total = count_total(reminders)
-            if total > 0:
-                total_reminders += total
-                for level in ("P0", "P1", "P2"):
-                    for r in reminders[level]:
-                        todo_lines.append((level, r["project"], r["msg"]))
+            batches = [b for b in db.get_batches(proj["project_id"])
+                       if b["status"] in RNSVC.ENABLED_STATES]
+            for b in batches:
+                reminders = RNSVC.compute_reminders_for_batch(b["batch_id"], today)
+                if not reminders:
+                    continue
+                total_reminders += len(reminders)
+                for r in reminders:
+                    todo_lines.append((r["level"], r.get("project") or
+                                       proj["project_name"], r["msg"]))
 
         if total_reminders == 0:
             self.reminder_text.setText("今日暂无待办，一切正常")

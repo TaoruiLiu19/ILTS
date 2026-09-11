@@ -29,6 +29,16 @@ db.init_db()
 FAILED = []
 
 
+def _ts(s):
+    """§6.6：时间戳存 ISO 8601 +08:00；比较时归一到 'YYYY-MM-DD HH:MM'。"""
+    return str(s or "").replace("T", " ")[:16]
+
+
+def _is_iso08(s):
+    import re as _re
+    return bool(_re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?\+08:00$", str(s or "")))
+
+
 def check(cond, msg):
     print(f"  {'PASS' if cond else 'FAIL'}  {msg}")
     if not cond:
@@ -79,13 +89,15 @@ rows = db.get_op_log_range(PID, start="2026-09-09 00:00", end="2026-09-09 23:59"
 mine = [r for r in rows if r["subject"] == doc]
 check(len(mine) == 1, "同日同单证只留 1 行（提交/撤交不并存）")
 check(mine[0]["kind"] == "file_submit", "最终态 = 提交（最后动作）")
-check(mine[0]["created_at"] == "2026-09-09 15:00", "时间戳 = 最后一次动作时间")
+check(_ts(mine[0]["created_at"]) == "2026-09-09 15:00", "时间戳 = 最后一次动作时间")
+check(_is_iso08(mine[0]["created_at"]),
+      f"§6.6 时间戳为 ISO 8601 +08:00（实际 {mine[0]['created_at']!r}）")
 # 再撤交 → 仍是 1 行，但 kind 变为撤交
 oplog("file_withdraw", PID, node_id=1, subject=doc, detail="撤交",
       created_at="2026-09-09 16:00")
 mine = [r for r in db.get_op_log_range(PID) if r["subject"] == doc]
 check(len(mine) == 1 and mine[0]["kind"] == "file_withdraw"
-      and mine[0]["created_at"] == "2026-09-09 16:00",
+      and _ts(mine[0]["created_at"]) == "2026-09-09 16:00",
       "再撤交 → 仍 1 行，覆盖为「撤销 + 16:00」")
 # 跨天保留：次日再提交 → 多一行
 oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
@@ -93,7 +105,8 @@ oplog("file_submit", PID, node_id=1, subject=doc, detail="提交",
 mine = [r for r in db.get_op_log_range(PID) if r["subject"] == doc]
 check(len(mine) == 2, "跨天各留一行（9/9 撤销 + 9/10 提交）")
 last = db.last_file_actions(PID).get(doc)
-check(last and last["created_at"] == "2026-09-10 09:00", "last_file_actions 取全局最后一次")
+check(last and _ts(last["created_at"]) == "2026-09-10 09:00",
+      "last_file_actions 取全局最后一次")
 
 
 print("== 3. 位移当日净收敛 + 撤销分离（T15） ==")
@@ -122,7 +135,7 @@ blk = reporting.blocks(m)
 check(any(b["t"] == "h" and "单证最新状态" in b["text"] for b in blk),
       "报告含「单证最新状态」板块")
 inv = next(x for x in states if x["doc_name"] == doc)
-check(inv["at"] == "2026-09-10 09:00" and inv["action"] == "提交",
+check(_ts(inv["at"]) == "2026-09-10 09:00" and inv["action"] == "提交",
       "最新状态取全局最后一次动作（跨天）")
 mw = reporting.build_report("weekly", "2026-09-07")
 check(mw["weekly_compare"] is None or isinstance(mw["weekly_compare"], dict),
@@ -199,9 +212,15 @@ todo_tbl = [b for b in blk if b["t"] == "table"
             and b["header"][:1] == ["日期"] and "单证" in b["header"]]
 check(bool(todo_tbl), "待办表格已包含「单证」列")
 if todo_tbl:
-    check(todo_tbl[0]["header"] == ["日期", "优先级", "项目", "节点", "单证"],
-          f"表头为 日期/优先级/项目/节点/单证（实际 {todo_tbl[0]['header']}）")
-    check(all(len(r) == 5 for r in todo_tbl[0]["rows"]), "每行 5 列")
+    # §11 要求报告两级口径：待办/未完成清单必须带「批次」列。
+    # 断言语义（必备列齐备 + 行与表头对齐），不再冻结精确列清单，
+    # 以免 §11 后续追加「客户/柜号」列时误报。
+    hdr = todo_tbl[0]["header"]
+    check(hdr[0] == "日期" and "项目" in hdr and "节点" in hdr and "单证" in hdr,
+          f"表头含 日期/项目/节点/单证（实际 {hdr}）")
+    check("批次" in hdr, f"§11 待办表含「批次」列（实际 {hdr}）")
+    check(all(len(r) == len(hdr) for r in todo_tbl[0]["rows"]),
+          f"每行列数与表头一致（{len(hdr)} 列）")
 check(all("docs" in it for it in td["items"]), "待办条目均带 docs 字段")
 
 # 单证列内容 = 该节点未提交的必填单证

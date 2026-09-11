@@ -56,6 +56,31 @@ YELLOW         = "#FFCC00"
 GRAY           = "#C7C7CC"
 GRAY_SOFT      = "#F2F2F7"
 
+# ── §10.5 依赖提醒：上游未完成 → 下游标黄 ──
+WAITING_YELLOW = "#E8A400"   # 比 YELLOW 略深，保证浅底上文字可读
+
+# ── 项目 / 批次「已取消」配色（§8 D14/D30 T32：留在列表并标注「已取消」，不进已完成页） ──
+CANCELLED      = "#8E8E93"   # 中性灰：已取消（区别于 Completed 的绿 / Active 的蓝）
+CANCELLED_SOFT = "#EDEDF0"
+PROJECT_STATUS_COLORS = {
+    "Active":    ACCENT,
+    "Completed": GREEN,
+    "Cancelled": CANCELLED,
+}
+PROJECT_STATUS_TEXT = {
+    "Active":    "进行中",
+    "Completed": "已完成",
+    "Cancelled": "已取消",
+}
+
+
+def get_project_status_color(status):
+    return PROJECT_STATUS_COLORS.get(status, TEXT_SECONDARY)
+
+
+def get_project_status_text(status):
+    return PROJECT_STATUS_TEXT.get(status, status)
+
 # ── 圆角 ──
 RADIUS_SM   = 8
 RADIUS_MD   = 12

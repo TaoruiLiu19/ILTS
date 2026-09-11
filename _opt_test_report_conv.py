@@ -65,7 +65,8 @@ for it in items:
 docs = [it for it in items if it["kind"] in ("file_submit","file_withdraw")]
 byA = [it for it in docs if it["subject"]==docA]
 check(len(byA)==1, f"表单{docA} 当日收敛为 1 条")
-check(byA and byA[0]["kind"]=="file_submit" and byA[0]["created_at"]=="2026-09-09 11:00",
+check(byA and byA[0]["kind"]=="file_submit"
+      and str(byA[0]["created_at"]).replace("T", " ")[:16] == "2026-09-09 11:00",
       "收敛保留当日最后一条（11:00 提交）")
 byB = [it for it in docs if it["subject"]==docB]
 check(len(byB)==1 and byB[0]["kind"]=="file_submit", "表单B 单次提交保留")

@@ -17,10 +17,8 @@ from ui.theme import GLOBAL_QSS, APP_FONT, APP_FONT_SIZE, ensure_check_asset
 from ui.main_window import MainWindow
 
 # 复用已有的 mock_data
-from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
+from mock_data import seed_demo_project
 from mock_completed import seed_completed_demo
-from services.file_checklist import bootstrap
-from config import get_port
 
 
 def _oplog(*args, **kw):
@@ -29,53 +27,8 @@ def _oplog(*args, **kw):
 
 
 def seed_demo():
-    """如果数据库为空，灌入 Mock 演示数据"""
-    if db.count_projects("Active") > 0:
-        return
-
-    project_id = DEMO_PROJECT["project_id"]
-    plan = get_demo_schedule()
-
-    # 写入项目
-    db.insert_project({
-        "project_id": project_id,
-        "project_name": DEMO_PROJECT["project_name"],
-        "country": DEMO_PROJECT["country"],
-        "export_port": DEMO_PROJECT["export_port"],
-        "etd": DEMO_PROJECT["etd"],
-        "eta": DEMO_PROJECT["eta"],
-        "buffer_days": DEMO_PROJECT["buffer_days"],
-    })
-
-    # 写入节点
-    nodes = []
-    for n in DEMO_NODES:
-        s, e = plan[n["node_id"]]
-        remark = n.get("remark", "")
-        port = get_port(DEMO_PROJECT["export_port"])
-        if port and n["node_id"] in port.get("platform_notes", {}):
-            platform = port["platform_notes"][n["node_id"]]
-            remark = f"{remark} | {platform}" if remark else platform
-        nodes.append({
-            "node_id": n["node_id"],
-            "node_name": n["node_name"],
-            "role_label": n["role_label"],
-            "seq": n["seq"],
-            "area": n["area"],
-            "default_duration": n["duration"],
-            "duration": n["duration"],
-            "plan_start": s,
-            "plan_end": e,
-            "remark": remark,
-        })
-    db.insert_nodes(project_id, nodes)
-
-    # 写入单证
-    files = bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan)
-    db.insert_files(project_id, files)
-
-    print(f"[Seed] Demo 项目已灌入: {DEMO_PROJECT['project_name']}")
-    print(f"  节点数: {len(nodes)} | 单证数: {len(files)}")
+    """如果数据库为空，灌入 Mock 演示数据（项目 + 默认批次 + 节点 + 单证）"""
+    seed_demo_project()
 
 
 def seed_oplog_demo():
@@ -88,15 +41,18 @@ def seed_oplog_demo():
         return
     pid = projects[0]["project_id"]
     proj = db.get_project(pid)
-    # 节点1 必填单证「提交」
+    batch_id = db.current_batch_id(pid)
+    # 出口报关节点（EXPORT_CUSTOMS）必填单证「提交」
     files = db.get_files(pid)
+    key = "EXPORT_CUSTOMS"
     node1_file = next((f for f in files
-                       if f.get("node_id") == 1 and f["doc_type"] == "required"), None)
+                       if f.get("node_key") == key and f["doc_type"] == "required"), None)
     if node1_file:
-        _oplog("file_submit", pid, node_id=1, subject=node1_file["doc_name"],
-               detail="提交", created_at=f"{proj['create_date']} 09:1")
-    _oplog("vessel_position", pid, subject="船舶",
-           detail="登记实际 ETA（演示）", created_at=f"{proj['create_date']} 10:2")
+        _oplog("file_submit", pid, batch_id=batch_id, node_id=node1_file.get("node_id"),
+               node_key=key, subject=node1_file["doc_name"],
+               detail="提交", created_at=f"{proj['create_date']} 09:10:00")
+    _oplog("vessel_position", pid, batch_id=batch_id, subject="船舶",
+           detail="登记实际 ETA（演示）", created_at=f"{proj['create_date']} 10:20:00")
     db.set_setting("oplog_demo_seeded", "1")
 
 

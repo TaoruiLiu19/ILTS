@@ -21,6 +21,15 @@ from services.cargo_check import normalize_item, item_over_types, summary
 from services.vessel_status import fetch_latest_status, register_manual_position
 from mock_data import DEMO_PROJECT, DEMO_NODES, get_demo_schedule
 from services.file_checklist import bootstrap
+from services import node_template as nt
+
+# ── 节点分区（按 node_key/area，禁止硬编码 node_id —— D20/§5.2） ──
+_TMPL = nt.template()
+DOME_IDS = [n["node_id"] for n in _TMPL if n["area"] == "DOME"]
+OVERSEA_IDS = [n["node_id"] for n in _TMPL if n["area"] == "OVERSEA"]
+SEA = nt.by_key(nt.SEA_TRANSIT)["node_id"]              # 海运锚点
+DOME_LAST = nt.by_key(nt.LOADING)["node_id"]            # 境内末节点
+FIRST_OVERSEA = nt.by_key(nt.ARRIVAL_NOTICE)["node_id"]  # 境外首节点
 
 # ── 隔离数据库 ──
 _TMP = tempfile.mkdtemp(prefix="opt_test_")
@@ -91,14 +100,14 @@ normal = next(c for c in cargo if c["item_name"].startswith("光伏"))
 check(normal["over_flag"] == 0, "S1 普通项不误报")
 check(summary(cargo)["over"] == 1, "S1 超限统计 = 1")
 
-# ── S2 境外节点⑥ 推迟 3 天 ──
-print("\n== S2 境外节点⑥ 推迟 3 天 ==")
+# ── S2 境外首节点 推迟 3 天 ──
+print("\n== S2 境外首节点 推迟 3 天 ==")
 before, proj0 = nd(pid), db.get_project(pid)
-apply_shift(pid, 6, 3)
+apply_shift(pid, FIRST_OVERSEA, 3)
 after = nd(pid)
-check(all(after[i] == before[i] for i in range(1, 6)), "S2 境内 1-5 与海运不变")
+check(all(after[i] == before[i] for i in DOME_IDS + [SEA]), "S2 境内全段与海运不变")
 check(all((d(after[i]["plan_start"]) - d(before[i]["plan_start"])).days == 3
-          for i in range(6, 13)), "S2 节点6-12 顺延 +3")
+          for i in OVERSEA_IDS), "S2 境外全段顺延 +3")
 proj1 = db.get_project(pid)
 check(proj1["eta"] == proj0["eta"] and proj1["etd"] == proj0["etd"], "S2 ETA/ETD 不变")
 
@@ -107,46 +116,48 @@ print("\n== S3 境内节点② 提前 2 天 ==")
 before, proj_b = nd(pid), db.get_project(pid)
 apply_shift(pid, 2, -2)
 after = nd(pid)
-for i in (2, 3, 4):
+for i in [x for x in DOME_IDS if x >= 2]:
     check((d(before[i]["plan_start"]) - d(after[i]["plan_start"])).days == 2,
           f"S3 节点{i} 提前 -2")
 check(after[1] == before[1], "S3 节点1 不受影响（前段留窗口）")
-check(after[5]["plan_start"] == after[4]["plan_end"], "S3 海运 start 联动境内末")
-check(d(after[5]["plan_start"]) == d(before[5]["plan_start"]) - timedelta(days=2),
+check(after[SEA]["plan_start"] == after[DOME_LAST]["plan_end"], "S3 海运 start 联动境内末")
+check(d(after[SEA]["plan_start"]) == d(before[SEA]["plan_start"]) - timedelta(days=2),
       "S3 海运 start(ETD) 提前 2 天")
-check(after[5]["plan_end"] == before[5]["plan_end"], "S3 海运 end/ETA 不动")
-check(db.get_project(pid)["etd"] == after[5]["plan_start"], "S3 项目 ETD 联动更新")
-check(all(after[i] == before[i] for i in range(6, 13)), "S3 境外 6-12 不动")
+check(after[SEA]["plan_end"] == before[SEA]["plan_end"], "S3 海运 end/ETA 不动")
+check(db.get_project(pid)["etd"] == after[SEA]["plan_start"], "S3 项目 ETD 联动更新")
+check(all(after[i] == before[i] for i in OVERSEA_IDS), "S3 境外段不动")
 
-# ── S4 海运节点⑤ 推迟 5 天 ──
-print("\n== S4 海运节点⑤ 推迟 5 天 ==")
+# ── S4 海运节点 推迟 5 天 ──
+print("\n== S4 海运节点 推迟 5 天 ==")
 before, proj_b = nd(pid), db.get_project(pid)
-apply_shift(pid, 5, 5)
+apply_shift(pid, SEA, 5)
 after = nd(pid)
-check(after[5]["plan_start"] == before[5]["plan_start"], "S4 海运 start(ETD) 不变")
-check((d(after[5]["plan_end"]) - d(before[5]["plan_end"])).days == 5, "S4 海运 end/ETA +5")
-check(int(after[5]["duration"]) == (d(after[5]["plan_end"]) - d(after[5]["plan_start"])).days,
+check(after[SEA]["plan_start"] == before[SEA]["plan_start"], "S4 海运 start(ETD) 不变")
+check((d(after[SEA]["plan_end"]) - d(before[SEA]["plan_end"])).days == 5, "S4 海运 end/ETA +5")
+check(int(after[SEA]["duration"]) == (d(after[SEA]["plan_end"]) - d(after[SEA]["plan_start"])).days,
       "S4 海运 duration = eta−etd 重算")
 check(all((d(after[i]["plan_start"]) - d(before[i]["plan_start"])).days == 5
-          for i in range(6, 13)), "S4 境外全段 6-12 顺延 +5")
-check(all(after[i] == before[i] for i in range(1, 5)), "S4 境内 1-4 不动")
-check(db.get_project(pid)["eta"] == after[5]["plan_end"], "S4 项目 ETA = 原 ETA+5")
+          for i in OVERSEA_IDS), "S4 境外全段顺延 +5")
+check(all(after[i] == before[i] for i in [x for x in DOME_IDS if x < SEA]), "S4 境内不动")
+check(db.get_project(pid)["eta"] == after[SEA]["plan_end"], "S4 项目 ETA = 原 ETA+5")
 
-# ── S6 位移后单证 due 跟随重算 ──
+# ── S6 位移后单证 due 跟随重算（按 node_key 锚点，不按 node_id） ──
 print("\n== S6 单证 due 跟随重算 ==")
 files = db.get_files(pid)
-f7 = [f for f in files if f.get("node_id") == 7 and f.get("due_type") == "node_start"]
-f5 = [f for f in files if f.get("node_id") == 5 and f.get("due_type") == "node_start"]
-check(bool(f7) and f7[0]["due_date"] == nd(pid)[7]["plan_start"],
-      "S6 节点7 单证 due == 新 node_start")
-check(bool(f5) and f5[0]["due_date"] == nd(pid)[5]["plan_start"],
+sea_docs = [f for f in files if f.get("due_node_key") == nt.SEA_TRANSIT
+            and f.get("due_type") == "node_start"]
+doc_docs = [f for f in files if f.get("due_node_key") == nt.D_O_COLLECT
+            and f.get("due_type") == "node_start"]
+check(bool(doc_docs) and doc_docs[0]["due_date"] == nd(pid)[FIRST_OVERSEA + 1]["plan_start"],
+      "S6 换单类单证 due == 新锚点 node_start")
+check(bool(sea_docs) and sea_docs[0]["due_date"] == nd(pid)[SEA]["plan_start"],
       "S6 海运正本提单 due == 新海运 start")
 
 # ── S7 delay_days 净位移 / shift_history ──
 print("\n== S7 净位移与历史 ==")
-n5, n6 = nd(pid)[5], nd(pid)[6]
-check(n5["delay_days"] == -2 + 5, "S7 海运节点⑤ 净位移 = +3（-2 提前后 +5 推迟）")
-check(n6["delay_days"] == 3 + 5, "S7 境外节点⑥ 净位移 = +8")
+n5, n6 = nd(pid)[SEA], nd(pid)[FIRST_OVERSEA]
+check(n5["delay_days"] == -2 + 5, "S7 海运节点 净位移 = +3（-2 提前后 +5 推迟）")
+check(n6["delay_days"] == 3 + 5, "S7 境外首节点 净位移 = +8")
 check(n5["is_delayed"] == 1, "S7 is_delayed 已标记")
 hist = db.get_shift_history(pid)
 check(len(hist) >= 3, "S7 shift_history 留痕 ≥3 组")
@@ -158,12 +169,12 @@ before = nd(pid)
 eta_before = db.get_project(pid)["eta"]
 undo_last_shift(pid)
 after = nd(pid)
-check((d(after[5]["plan_end"]) - d(before[5]["plan_end"])).days == -5,
+check((d(after[SEA]["plan_end"]) - d(before[SEA]["plan_end"])).days == -5,
       "撤销后海运 end 还原 -5")
 check(db.get_project(pid)["eta"] == (d(eta_before) - timedelta(days=5)).strftime("%Y-%m-%d"),
       "撤销后项目 ETA 还原")
-check(after[6]["delay_days"] == 3, "撤销后节点⑥ 净位移回到 +3（仅剩 S2）")
-check(after[5]["delay_days"] == -2, "撤销后海运节点⑤ 净位移回到 -2（仅剩 S3）")
+check(after[FIRST_OVERSEA]["delay_days"] == 3, "撤销后境外首节点 净位移回到 +3（仅剩 S2）")
+check(after[SEA]["delay_days"] == -2, "撤销后海运节点 净位移回到 -2（仅剩 S3）")
 
 # ── S5 守卫 ──
 print("\n== S5 四守卫 ==")
@@ -175,7 +186,7 @@ except ShiftError:
 
 db.update_node(pid, 9, status="Done", actual_completion_date=get_today_str())
 try:
-    apply_shift(pid, 6, 1)      # 窗口 6-12 含已完成节点9
+    apply_shift(pid, SEA, 1)    # 窗口 海运+境外段 含已完成节点9
     check(False, "S5-② Done 在位移窗口未拦截")
 except ShiftError:
     check(True, "S5-② 位移窗口含已完成节点被拦截")

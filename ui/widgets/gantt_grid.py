@@ -18,10 +18,11 @@ from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics
 from ui.widgets.scoped_scroll import ScopedScrollArea
 from services.clock import get_today
 from services.node_status import compute_node_status
+from services.node_template import LASHING, BUFFER_HINT
 from ui.theme import (
     AREA_COLORS, AREA_TEXT, AREA_FG, NODE_STATUS_COLORS, get_role_color,
     GRAY_SOFT, HAIRLINE, TEXT_SECONDARY, TEXT_PRIMARY, TEXT_TERTIARY,
-    ACCENT, ORANGE, RED, GREEN
+    ACCENT, ORANGE, RED, GREEN, YELLOW, WAITING_YELLOW
 )
 
 NAME_W = 170
@@ -54,6 +55,7 @@ class _GanttCanvas(QWidget):
         self._over_count = over_count or 0
         self._buffer_days = buffer_days or 4
         self._row_tags = {}         # node_id -> [(text, color), ...]
+        self._dep_waiting = {}      # node_key -> 上游文案（§10.5 依赖标黄）
         self._bottleneck_id = None
         self._col_dates = []        # 每列对应日期（海运压缩列为 None）
         self._col_area = []         # 每列所属区域
@@ -201,22 +203,27 @@ class _GanttCanvas(QWidget):
         if (longest and total_span > 0
                 and longest[1] / total_span >= BOTTLENECK_RATIO):
             self._bottleneck_id = longest[0]["node_id"]
-            tags.setdefault(longest[0]["node_id"], []).append(("⚠ 最长段", ACCENT))
+            tags.setdefault(longest[0]["node_id"], []).append(("最长段", ACCENT))
 
         for n in nodes:
             nid = n["node_id"]
             st = compute_node_status(n, self._today)
             n_tags = tags.get(nid, [])
 
-            # ── 吊装预警：货物台账存在超限项 → 节点3（捆扎固定）标红 ──
-            if nid == 3 and self._over_count > 0:
+            # ── 吊装预警：货物台账存在超限项 → LASHING（装箱/加固）标红 ──
+            if n.get("node_key") == LASHING and self._over_count > 0:
                 n_tags.append(("吊装预警", RED))
+
+            # ── §10.5 依赖提醒：上游单证未完成 → 该节点标黄「待上游」 ──
+            waiting = (self._dep_waiting or {}).get(n.get("node_key"))
+            if waiting:
+                n_tags.append((f"待上游：{waiting}", WAITING_YELLOW))
 
             # ── 风险：逾期 / 缓冲消耗 ──
             if st == "Overdue":
                 plan_end = _parse(n["plan_end"])
                 late = (self._today - plan_end).days
-                if nid in (9, 10):
+                if n.get("node_key") in BUFFER_HINT:
                     used = min(late, self._buffer_days)
                     n_tags.append((f"已耗缓冲{used}天", ORANGE))
                 n_tags.append((f"逾期{late}天", RED))
@@ -224,6 +231,15 @@ class _GanttCanvas(QWidget):
             if n_tags:
                 tags[nid] = n_tags
         self._row_tags = tags
+
+    def set_dependency_waiting(self, mapping):
+        """§10.5 依赖提醒：{node_key: '《MBL 主提单》'} → 对应节点标黄「待上游」。
+
+        数据来自 services.doc_dependency，由看板在加载批次时注入。
+        """
+        self._dep_waiting = dict(mapping or {})
+        self._compute_row_tags()
+        self.update()
 
     def _build_sea_labels(self):
         """
@@ -591,3 +607,7 @@ class GanttGrid(ScopedScrollArea):
     # 供联动方程序化高亮/清除（如反向联动）
     def set_hover_node(self, node):
         self._canvas._notify_hover(node)
+
+    # §10.5 依赖提醒：{node_key: '《MBL 主提单》'} → 对应节点标黄「待上游」
+    def set_dependency_waiting(self, mapping):
+        self._canvas.set_dependency_waiting(mapping)

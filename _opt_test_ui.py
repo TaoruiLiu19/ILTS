@@ -15,6 +15,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db
 from services.clock import set_simulated_today
+from services import node_template as nt
+
+# ── 节点锚点（一律按 node_key 定位，禁止硬编码 node_id —— D20/§5.2） ──
+_TMPL = nt.template()
+DOME_IDS = [n["node_id"] for n in _TMPL if n["area"] == "DOME"]
+OVERSEA_IDS = [n["node_id"] for n in _TMPL if n["area"] == "OVERSEA"]
+FIRST_OVERSEA = nt.by_key(nt.ARRIVAL_NOTICE)["node_id"]   # 境外首节点
+NODE_COUNT = len(_TMPL)                                   # 模板节点数（15）
+
+
+def _d(s):
+    return date(*map(int, s.split("-")))
+
 
 _TMP = tempfile.mkdtemp(prefix="opt_ui_")
 db.DB_PATH = os.path.join(_TMP, "t.db")
@@ -60,7 +73,21 @@ db.insert_cargo_items(pid, [
 db.upsert_vessel(pid, vessel_name="COSCO SHIPPING UNIVERSE", voyage="081W")
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
 app = QApplication(sys.argv)
+
+# 看门狗：位移被守卫拦截时产品会弹模态 QMessageBox，离屏无人点击会永久挂起。
+# 兜底 120s 强制失败退出，保证脚本一定「跑完 + 有明确结论」。
+WATCHDOG_MS = 120000
+
+
+def _watchdog():
+    print("❌ 看门狗超时（120s）：出现模态弹窗或阻塞 → 强制失败退出")
+    os._exit(2)
+
+
+QTimer.singleShot(WATCHDOG_MS, _watchdog)
+
 
 from ui.theme import GLOBAL_QSS, APP_FONT, APP_FONT_SIZE, ensure_check_asset
 from PySide6.QtGui import QFont
@@ -79,8 +106,8 @@ np_page = NewProjectPage()
 np_page.resize(1280, 900)
 np_page.show()
 app.processEvents()
-check(np_page._cargo_rows == [] and len(np_page._node_widgets) == 12,
-      "新建项目页构建（12 节点行 + 空台账）")
+check(np_page._cargo_rows == [] and len(np_page._node_widgets) == NODE_COUNT,
+      f"新建项目页构建（{NODE_COUNT} 节点行 + 空台账）")
 np_page._fill_samples()
 check(len(np_page._cargo_rows) == 2, "货物台账预填 2 行示例")
 np_page._add_cargo_row()
@@ -110,12 +137,17 @@ card._toggle_expand()
 app.processEvents()
 check(card.expand_area.isVisible(), "展开卡片")
 card._step_spin.setValue(1)
-card._shift_node(6, 1)          # 境外节点⑥ 推迟 1 天（成功路径，不弹窗）
+_oversea_before = {n["node_id"]: n["plan_start"] for n in db.get_nodes(pid)
+                   if n["node_id"] in OVERSEA_IDS}
+card._shift_node(FIRST_OVERSEA, 1)   # 境外首节点 推迟 1 天（成功路径，不弹窗）
 app.processEvents()
 check(card._op_note and "推迟" in card._op_note.text(), "位移操作提示已刷新")
 from services.clock import get_today
 eta = db.get_project(pid)["eta"]
-check(eta == DEMO_PROJECT["eta"], "节点⑥+1 不影响 ETA")
+check(eta == DEMO_PROJECT["eta"], "境外节点+1 不影响 ETA")
+_after = {n["node_id"]: n for n in db.get_nodes(pid)}
+check(all((_d(_after[i]["plan_start"]) - _d(_oversea_before[i])).days == 1
+          for i in OVERSEA_IDS), "境外全段顺延 +1（位移已生效）")
 
 print("\n== 对话框构建 ==")
 cd = CargoDialog(pid)
@@ -129,10 +161,11 @@ check(vd.vessel_name.text() == "COSCO SHIPPING UNIVERSE", "班轮对话框预填
 check(vd.history_list.count() >= 1, "船位历史列表可显示")
 vd.deleteLater()
 
-print("\n== S8 甘特高亮（今日置为节点10结束次日） ==")
-n10 = next(n for n in db.get_nodes(pid) if n["node_id"] == 10)
-end10 = n10["plan_end"]
-y, m, d = (int(x) for x in end10.split("-"))
+print("\n== S8 甘特高亮（今日置为最后一个缓冲提示节点结束日次日） ==")
+# 缓冲消耗提示节点（§5.2 / node_template.BUFFER_HINT）：海关查验 + 堆存费
+_buf_end = max(n["plan_end"] for n in db.get_nodes(pid)
+               if n["node_key"] in nt.BUFFER_HINT)
+y, m, d = (int(x) for x in _buf_end.split("-"))
 set_simulated_today(date(y, m, d) + __import__("datetime").timedelta(days=1))
 from services.clock import get_today as gt
 from ui.widgets.gantt_grid import GanttGrid
@@ -142,10 +175,21 @@ gantt = GanttGrid(db.get_nodes(pid), today,
                   over_count=1, buffer_days=4)
 app.processEvents()
 tags = gantt._canvas._row_tags
-check(any("吊装预警" in t for t, _ in tags.get(3, [])), "节点3 吊装预警标签（超限件）")
-check(any("最长段" in t for t, _ in tags.get(5, [])), "海运5 标「最长段」（瓶颈）")
-check(any("已耗缓冲" in t for t, _ in tags.get(9, [])), "节点9 逾期提示已耗缓冲")
-check(any("已耗缓冲" in t for t, _ in tags.get(10, [])), "节点10 逾期提示已耗缓冲")
+
+
+def tag_texts(node_key):
+    """按 node_key 取该行标签文案（模板改序/改号不影响本断言）"""
+    return [t for t, _ in tags.get(nt.by_key(node_key)["node_id"], [])]
+
+
+check(any("吊装预警" in t for t in tag_texts(nt.LASHING)),
+      "装箱/加固（吊装预警节点）标「吊装预警」（超限件）")
+check(any("最长段" in t for t in tag_texts(nt.SEA_TRANSIT)),
+      "海运节点标「最长段」（瓶颈）")
+check(any("已耗缓冲" in t for t in tag_texts(nt.CUSTOMS_INSPECT)),
+      "海关查验（缓冲提示节点）逾期提示已耗缓冲")
+check(any("已耗缓冲" in t for t in tag_texts(nt.STORAGE_FEE)),
+      "堆存费（缓冲提示节点）逾期提示已耗缓冲")
 gantt.resize(1240, 660)
 gantt.show()
 app.processEvents()

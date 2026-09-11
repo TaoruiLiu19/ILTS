@@ -5,9 +5,15 @@
   · next_report_no(ref_date)  生成时使用（消耗一个序号）
   · peek_report_no(ref_date)  预览时可看「将得到的编号」，不消耗序号
 导出文件写 data/reports/（已被 .gitignore 的 data/ 覆盖）。
+
+命名（§11）：
+  · 日报不变（ILTS_Daily_YYYY-MM-DD）
+  · 按批次筛选时追加 `_B01`（批次号，取批次的 B01 段）
+  · 周报沿用日期区间命名（ILTS_Weekly_ws_to_we）
 """
 
 import os
+import re
 from datetime import date, timedelta
 
 import db
@@ -41,12 +47,32 @@ def next_report_no(ref_date):
     return f"RPT-{key}-{seq:03d}"
 
 
-def default_filename(kind, ref_date):
+def batch_suffix(batch_id):
+    """按批次筛选时的文件名后缀：`_B01`（取批次号末段，非 B01 则用清洗后的批次号）。"""
+    if not batch_id:
+        return ""
+    b = db.get_batch(batch_id)
+    if not b:
+        return ""
+    no = (b.get("batch_no") or "").strip()
+    if no:
+        tail = no.split("-")[-1]
+        seg = tail if re.fullmatch(r"[A-Za-z0-9_]+", tail or "") else no
+    else:
+        seg = b.get("batch_name") or ""
+    seg = re.sub(r"[^0-9A-Za-z_\-]", "", seg) or ""
+    return f"_{seg}" if seg else ""
+
+
+def default_filename(kind, ref_date, batch_id=None):
     if kind == "daily":
-        return f"ILTS_Daily_{ref_date.strftime('%Y-%m-%d')}"
-    ws = ref_date - timedelta(days=ref_date.weekday())
-    we = ws + timedelta(days=6)
-    return f"ILTS_Weekly_{ws.strftime('%Y-%m-%d')}_to_{we.strftime('%Y-%m-%d')}"
+        base = f"ILTS_Daily_{ref_date.strftime('%Y-%m-%d')}"
+    else:
+        ws = ref_date - timedelta(days=ref_date.weekday())
+        we = ws + timedelta(days=6)
+        base = f"ILTS_Weekly_{ws.strftime('%Y-%m-%d')}_to_{we.strftime('%Y-%m-%d')}"
+    return base + batch_suffix(batch_id)
+
 
 
 def docx_available():
@@ -105,13 +131,18 @@ def _render_blocks_docx(doc, blocks):
             table = doc.add_table(rows=len(rows), cols=len(header))
             table.style = "Table Grid"
             red_ids = blk.get("red") or set()
+            # 红字列：优先按表头语义定位（报表列顺序会随两级口径变化），
+            # 找不到时退回旧列位 (3,4)。
+            red_cols = {i for i, h in enumerate(header)
+                        if h in ("逾期(天)", "缺失单证", "变更后新增逾期")}
+            red_cols = red_cols or {3, 4}
             for ri, row in enumerate(rows):
                 for ci, cell in enumerate(row):
                     para = table.cell(ri, ci).paragraphs[0]
                     run = para.add_run(str(cell))
                     if ri == 0:
                         run.bold = True
-                    if ri - 1 in red_ids and (ci in (4, 3)):
+                    if ri - 1 in red_ids and ci in red_cols:
                         run.font.color.rgb = __import__("docx").shared.RGBColor(0xC0, 0x39, 0x2B)
                     _set_cn(run, "微软雅黑")
                     run.font.size = Pt(9.5)
@@ -125,11 +156,14 @@ def _set_cn(run, font):
 
 
 def export(model, blocks, out_dir=None):
-    """根据是否安装 python-docx 决定导 docx 或 txt。返回 (path, kind)"""
+    """根据是否安装 python-docx 决定导 docx 或 txt。返回 (path, kind)
+
+    按批次筛选时文件名追加 `_B01`（§11）；日报编号规则不变。
+    """
     out_dir = out_dir or REPORTS_DIR
     os.makedirs(out_dir, exist_ok=True)
     ref = date(*[int(x) for x in model["ref_date"].split("-")])
-    base = default_filename(model["kind"], ref)
+    base = default_filename(model["kind"], ref, model.get("batch_filter"))
     path = os.path.join(out_dir, base)
 
     if docx_available():

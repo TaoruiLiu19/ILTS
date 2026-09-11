@@ -8,13 +8,16 @@ from services.clock import get_today
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QScrollArea, QSpinBox, QMessageBox, QTabBar, QSizePolicy
+    QFrame, QScrollArea, QSpinBox, QMessageBox, QTabBar, QSizePolicy, QComboBox,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QCursor
+from PySide6.QtGui import QCursor, QColor
 
 import db
 from config import get_country, get_port
+from services import batches as batches_svc
+from services import modes as mode_names
 from services.node_status import (
     compute_node_status, get_current_node, compute_all_status,
     sync_doc_completion, sync_active_projects
@@ -122,7 +125,7 @@ class ShiftRow(QFrame):
 
 
 class ProjectCard(QFrame):
-    """折叠/展开的项目卡片（含 货物·班轮 摘要 + 动态调整面板）"""
+    """折叠/展开的项目卡片（含 批次列表 + 当前批次甘特/单证）"""
 
     def __init__(self, project, parent=None, on_changed=None, init_state=None, on_state=None):
         super().__init__(parent)
@@ -143,6 +146,11 @@ class ProjectCard(QFrame):
         self._pop = None               # 节点速览悬浮卡（懒创建）
         self._gantt_grid = None
         self._file_panel = None
+        # 批次列表与当前批次
+        self._batches = []
+        self._current_batch_id = None
+        self._batch_list_widget = None
+        self._batch_buttons = []
         self._load()
         self.setObjectName("card")
         self._apply_card_shadow()
@@ -152,11 +160,33 @@ class ProjectCard(QFrame):
 
     def _load(self):
         pid = self._project["project_id"]
+        # 刷新项目行：current_batch_id / status 可能已被其它面板改写，
+        # 用陈旧内存值会导致「切了批次又跳回旧批次」。
+        fresh = db.get_project(pid)
+        if fresh:
+            self._project = fresh
         self._today = get_today()
-        self._nodes = db.get_nodes(pid)
-        self._files = db.get_files(pid)
-        self._vessel = db.get_vessel(pid)
-        cargo = db.get_cargo_items(pid)
+        self._batches = db.get_batches(pid)
+        # 取最近 non-cancelled 作为当前
+        if self._batches:
+            # current_batch_id from project if exists
+            cur = self._project.get("current_batch_id")
+            found = next((b for b in self._batches if b["batch_id"] == cur), None)
+            if not found:
+                found = self._batches[-1] if self._batches else None
+            if found:
+                self._current_batch_id = found["batch_id"]
+        else:
+            # 无批次 → 创建默认（兼容旧项目迁移）
+            from db import create_default_batch
+            b = create_default_batch(pid)
+            self._batches = db.get_batches(pid)
+            self._current_batch_id = b["batch_id"]
+        # 按当前批次加载子数据
+        self._nodes = db.get_nodes_by_batch(self._current_batch_id)
+        self._files = db.get_files_by_batch(self._current_batch_id)
+        self._vessel = db.get_vessel(pid, self._current_batch_id)
+        cargo = db.get_cargo_items(pid, self._current_batch_id)
         self._cargo = cargo
         cs = summary(cargo) if cargo else {"count": 0, "over": 0}
         self._cargo_count = cs["count"]
@@ -199,7 +229,11 @@ class ProjectCard(QFrame):
 
         country_tmpl = get_country(self._project["country"])
         flag = country_tmpl.get("flag", "")
-        self.name_label = QLabel(f"{flag}  {self._project['project_name']}")
+        # §D30/T32：全取消项目在看板上标注「已取消」
+        status_tag = ""
+        if self._project.get("status") == "Cancelled":
+            status_tag = " · 已取消"
+        self.name_label = QLabel(f"{flag}  {self._project['project_name']}{status_tag}")
         self.name_label.setStyleSheet(f"font-size: 15px; font-weight: 600; color: {TEXT_PRIMARY};")
         self.name_label.setWordWrap(True)
         left_layout.addWidget(self.name_label)
@@ -224,6 +258,37 @@ class ProjectCard(QFrame):
         mid_layout = QVBoxLayout(mid)
         mid_layout.setContentsMargins(12, 14, 12, 14)
         mid_layout.setSpacing(8)
+
+        # 批次切换行
+        batch_row = QHBoxLayout()
+        batch_row.setSpacing(8)
+        batch_row.addWidget(QLabel("批次"), 0)
+        self.batch_combo = QComboBox()
+        self.batch_combo.setObjectName("batchCombo")
+        self.batch_combo.setCursor(Qt.PointingHandCursor)
+        self.batch_combo.currentIndexChanged.connect(self._on_batch_changed)
+        batch_row.addWidget(self.batch_combo, 1)
+        self.batch_status = QLabel("")
+        batch_row.addWidget(self.batch_status)
+        mid_layout.addLayout(batch_row)
+
+        # §12.1 「N 批次 · 风险汇总」+ 新增/复制批次入口
+        summary_row = QHBoxLayout()
+        summary_row.setSpacing(8)
+        self.batch_summary = QLabel("")
+        self.batch_summary.setObjectName("batchSummary")
+        summary_row.addWidget(self.batch_summary, 1)
+        self.new_batch_btn = QPushButton("新增批次")
+        self.new_batch_btn.setObjectName("ghost")
+        self.new_batch_btn.setCursor(Qt.PointingHandCursor)
+        self.new_batch_btn.clicked.connect(self._open_new_batch)
+        summary_row.addWidget(self.new_batch_btn)
+        self.copy_batch_btn = QPushButton("复制批次")
+        self.copy_batch_btn.setObjectName("ghost")
+        self.copy_batch_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_batch_btn.clicked.connect(self._copy_current_batch)
+        summary_row.addWidget(self.copy_batch_btn)
+        mid_layout.addLayout(summary_row)
 
         self.cur_label = QLabel("")
         self.cur_label.setStyleSheet(f"font-size: 12px; color: {TEXT_SECONDARY}; font-weight: 500;")
@@ -292,8 +357,30 @@ class ProjectCard(QFrame):
         bar_color = RED if has_overdue else (ORANGE if has_active else GREEN)
         self._bar.setStyleSheet(f"background: {bar_color};")
 
-        # 目的港
-        port = get_port(self._project.get("export_port"))
+        # 批次切换下拉
+        cur = db.get_batch(self._current_batch_id)
+        if getattr(self, "batch_combo", None) is not None:
+            b = self.batch_combo.blockSignals(True)
+            self.batch_combo.clear()
+            for bt in self._batches:
+                no = bt["batch_no"] or bt["batch_name"]
+                if bt["batch_id"] == self._current_batch_id:
+                    no += " (当前)"
+                self.batch_combo.addItem(no or bt["batch_name"], bt["batch_id"])
+            self.batch_combo.setCurrentIndex(max(0, self._current_batch_index()))
+            self.batch_combo.blockSignals(b)
+            st = batches_svc.state_label((cur or {}).get("status") or "draft")
+            color = {"进行中": RED, "逾期": RED}.get(st, TEXT_SECONDARY)
+            self.batch_status.setText(st)
+            self.batch_status.setStyleSheet(
+                f"font-size: 11px; font-weight: 600; color: {TEXT_SECONDARY};"
+                f" background: {ACCENT_SOFT}; border-radius: 6px; padding: 2px 8px;"
+            )
+        self._refresh_batch_summary()
+
+        # 目的港（来自线路）
+        route = db.get_route(self._current_batch_id)
+        port = get_port((route or {}).get("export_port") or self._project.get("export_port"))
         self.port_label.setText(f"出口港 · {port['name']}" if port else "通用方案")
 
         # 班轮（船名/航次）
@@ -317,12 +404,12 @@ class ProjectCard(QFrame):
             f"当前 · 节点{current['node_id']} {current['node_name']}"
             if current else "全部完成")
 
-        # ETD/进度/货物
-        etd = self._project["etd"]
-        days_to_etd = (_parse(etd) - self._today).days
+        # ETD/进度/货物（用当前批次线路）
+        etd = (route or {}).get("etd") if route else self._project.get("etd")
+        days_to_etd = (_parse(etd) - self._today).days if etd else 0
         self.etd_label.setText(
             f"ETD {etd} · 距 {'离港' if days_to_etd >= 0 else '已离港'} {abs(days_to_etd)} 天"
-            if days_to_etd >= 0 else f"ETD {etd} · 已离港 {abs(days_to_etd)} 天")
+            if etd else "未设船期")
 
         done_count = sum(1 for s in statuses.values() if s == "Done")
         fc = count_files(self._files)
@@ -339,7 +426,7 @@ class ProjectCard(QFrame):
             self.cargo_label.setStyleSheet("")
 
         # 位移历史概要
-        hist = db.get_shift_history(self._project["project_id"], limit=1)
+        hist = db.get_shift_history(self._project["project_id"], limit=1, batch_id=self._current_batch_id)
         if hist:
             h = hist[0]
             self.history_label.setText(
@@ -350,6 +437,186 @@ class ProjectCard(QFrame):
         # 迷你进度条跟随最新节点日期
         if getattr(self, "mini_bar", None):
             self.mini_bar.update_data(self._nodes, self._today)
+
+    def _current_batch_index(self):
+        for i, bt in enumerate(self._batches):
+            if bt["batch_id"] == self._current_batch_id:
+                return i
+        return 0
+
+    def _on_batch_changed(self, index):
+        if index < 0:
+            return
+        bid = self.batch_combo.itemData(index)
+        if bid == self._current_batch_id:
+            return
+        self._current_batch_id = bid
+        db.update_project(self._project["project_id"], current_batch_id=bid)
+        self._load()
+        self._after_change()
+
+    # ── §12.1 批次列表（N 批次 · 风险汇总）与新增批次 ──
+
+    def _batch_metrics(self, batch_id):
+        """单批次汇总：线路 / 状态 / 发运日 / 单证完成率 / 待办数。"""
+        nodes = db.get_nodes_by_batch(batch_id)
+        files = db.get_files_by_batch(batch_id)
+        route = db.get_route(batch_id) or {}
+        b = db.get_batch(batch_id) or {}
+        n_done = sum(1 for n in nodes if n.get("status") == "Done")
+        req = [f for f in files if f.get("doc_type") == "required"]
+        submitted = sum(1 for f in req if f.get("status") == "submitted")
+        overdue = sum(1 for n in nodes if compute_node_status(n, self._today) == "Overdue")
+        pending = len(req) - submitted
+        return {
+            "batch_id": batch_id,
+            "batch_no": b.get("batch_no") or "",
+            "batch_name": b.get("batch_name") or "",
+            "status": b.get("status") or "draft",
+            "status_cn": batches_svc.state_label(b.get("status") or "draft"),
+            "mode": route.get("mode_primary") or "SEA",
+            "port": route.get("export_port") or "",
+            "etd": route.get("etd") or "",
+            "eta": route.get("eta") or "",
+            "node_done": n_done, "node_total": len(nodes),
+            "doc_rate": (submitted / len(req) * 100) if req else 0.0,
+            "doc_total": len(req), "doc_submitted": submitted,
+            "todo": pending, "overdue": overdue,
+        }
+
+    def _risk_summary(self):
+        """风险汇总：N 批次 · 逾期节点 X · 待办单证 Y。"""
+        all_b = list(self._batches)
+        cur = db.get_batch(self._current_batch_id)
+        if cur and cur.get("status") == "cancelled" and \
+                not any(b["batch_id"] == cur["batch_id"] for b in all_b):
+            all_b.append(cur)
+        overdue = todo = 0
+        for bt in all_b:
+            m = self._batch_metrics(bt["batch_id"])
+            overdue += m["overdue"]
+            todo += m["todo"]
+        return {"n_batch": len(all_b), "overdue": overdue, "todo": todo}
+
+    def _refresh_batch_summary(self):
+        if getattr(self, "batch_summary", None) is None:
+            return
+        s = self._risk_summary()
+        bits = [f"{s['n_batch']} 批次"]
+        if s["overdue"]:
+            bits.append(f"逾期节点 {s['overdue']}")
+        if s["todo"]:
+            bits.append(f"待办单证 {s['todo']}")
+        if not s["overdue"] and not s["todo"]:
+            bits.append("无风险")
+        self.batch_summary.setText(" · ".join(bits))
+        tone = RED if (s["overdue"] or s["todo"]) else GREEN
+        self.batch_summary.setStyleSheet(
+            f"font-size: 11px; font-weight: 600; color: {tone};")
+
+    def _node_waiting(self):
+        """§10.5：{node_key: '《MBL 主提单》'} —— 该节点上存在「待上游」的必填单证。"""
+        out = {}
+        try:
+            from services import doc_dependency as dep
+            # apply_context → (by_file_id, by_doc_key, ctx)，与 FilePanel 同源
+            by_file, by_key, _ctx = dep.apply_context(self._current_batch_id, self._files)
+        except Exception:
+            return out
+        by_key = by_key or {}
+        for f in self._files or []:
+            if f.get("status") == "submitted":
+                continue
+            st = by_file.get(f.get("file_id")) if by_file else None
+            if not st or not st.get("blocked"):
+                continue
+            nk = f.get("node_key") or f.get("due_node_key")
+            if nk and nk not in out:
+                names = st.get("waiting_names") or []
+                out[nk] = ("、".join(f"《{n}》" for n in names)
+                           if names else "上游单证")
+        return out
+
+    def _open_new_batch(self):
+        """§12.1 新增批次：自动编号建批次后打开批次管理补齐线路/船期。"""
+        from ui.batch_dialogs import BatchDialog
+        try:
+            nb = db.create_batch(self._project["project_id"])
+        except Exception as e:
+            QMessageBox.warning(self, "新增批次失败", str(e))
+            return
+        self._batches = db.get_batches(self._project["project_id"])
+        self._current_batch_id = nb["batch_id"]
+        db.update_project(self._project["project_id"], current_batch_id=nb["batch_id"])
+        self._load()
+        self._after_change()
+        dlg = BatchDialog(self._project["project_id"], nb["batch_id"], self)
+        if dlg.exec():
+            self._batches = db.get_batches(self._project["project_id"])
+            self._load()
+            self._after_change()
+        self._flash_note = f"✓ 已新增批次 {nb['batch_no']}"
+
+    def _copy_current_batch(self):
+        """§8 复制批次：复制批次信息 + 线路 + 冻结模板快照（不带状态/日志）。"""
+        src = db.get_batch(self._current_batch_id)
+        if not src:
+            return
+        try:
+            nb = batches_svc.copy_batch(self._project["project_id"], self._current_batch_id)
+        except Exception as e:
+            QMessageBox.warning(self, "复制批次失败", str(e))
+            return
+        self._batches = db.get_batches(self._project["project_id"])
+        self._current_batch_id = nb["batch_id"]
+        db.update_project(self._project["project_id"], current_batch_id=nb["batch_id"])
+        self._load()
+        self._after_change()
+        self._flash_note = f"✓ 已复制为 {nb['batch_no']}（冻结模板快照）"
+    def _build_batch_table(self):
+        """§12.1 批次列表：批次号/名称/线路/状态/发运日/单证完成率/待办数。"""
+        rows = []
+        all_b = list(self._batches)
+        cur = db.get_batch(self._current_batch_id)
+        if cur and cur.get("status") == "cancelled" and \
+                not any(b["batch_id"] == cur["batch_id"] for b in all_b):
+            all_b.append(cur)
+        for bt in all_b:
+            rows.append(self._batch_metrics(bt["batch_id"]))
+
+        t = QTableWidget(len(rows), 7)
+        t.setHorizontalHeaderLabels(
+            ["批次号", "名称", "线路", "状态", "发运日", "单证完成率", "待办数"])
+        t.verticalHeader().setVisible(False)
+        t.setEditTriggers(QTableWidget.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectRows)
+        t.setShowGrid(False)
+        t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        t.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        for i, r in enumerate(rows):
+            cells = [
+                r["batch_no"], r["batch_name"],
+                f'{mode_names.label(r["mode"])} · {r["port"] or "—"}',
+                r["status_cn"], r["etd"] or "—",
+                f'{r["doc_submitted"]}/{r["doc_total"]}（{r["doc_rate"]:.0f}%）',
+                str(r["todo"]),
+            ]
+            for c, v in enumerate(cells):
+                item = QTableWidgetItem(str(v))
+                if r["batch_id"] == self._current_batch_id:
+                    item.setBackground(QColor(ACCENT_SOFT))
+                t.setItem(i, c, item)
+        t.setFixedHeight(min(210, 34 + 30 * max(1, len(rows))))
+
+        def _row_dbl(row, _col):
+            if 0 <= row < len(rows):
+                self._current_batch_id = rows[row]["batch_id"]
+                db.update_project(self._project["project_id"],
+                                  current_batch_id=self._current_batch_id)
+                self._load()
+                self._after_change()
+        t.cellDoubleClicked.connect(_row_dbl)
+        return t
 
     # ── 展开/收起 ──
 
@@ -398,6 +665,15 @@ class ProjectCard(QFrame):
         active = sum(1 for s in statuses.values() if s == "Active")
         fc = count_files(self._files)
 
+        # §12.1 批次列表（批次号/名称/线路/状态/发运日/单证完成率/待办数）
+        batch_head = QLabel("批次列表（双击切换当前批次）")
+        batch_head.setObjectName("section")
+        layout.addWidget(batch_head)
+        try:
+            layout.addWidget(self._build_batch_table())
+        except Exception:
+            pass
+
         # 统计字牌（整行置顶），记录数值标签供轻量刷新
         self._chip = {}
         cargo_cap = f"货物 {self._cargo_count} / 超限 {self._cargo_over}"
@@ -435,6 +711,12 @@ class ProjectCard(QFrame):
             export_port=self._project.get("export_port"),
             over_count=self._cargo_over,
             buffer_days=self._project.get("buffer_days", 4))
+        # §10.5 依赖提醒：上游单证未完成 → 对应节点标黄「待上游」
+        try:
+            from services import doc_dependency as _dep
+            gantt.set_dependency_waiting(self._node_waiting())
+        except Exception:
+            pass
         gantt.setFixedHeight(gantt.auto_height())   # 完整高度，不出现上下滚动条
         gantt.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         gantt.setMinimumWidth(340)   # 避免宽画布把整页撑出横向滚动条（甘特内部横向滚动即可）
@@ -585,7 +867,8 @@ class ProjectCard(QFrame):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        file_panel = FilePanel(self._files, self._nodes, self._today)
+        file_panel = FilePanel(self._files, self._nodes, self._today,
+                               batch_id=self._current_batch_id)
         file_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         file_panel.file_toggled.connect(lambda fid, checked: self._toggle_file(fid, checked))
         lay.addWidget(file_panel, 1)
@@ -633,17 +916,45 @@ class ProjectCard(QFrame):
         act_row = QHBoxLayout()
         act_row.setSpacing(8)
 
+        batch_btn = QPushButton("批次管理")
+        batch_btn.setObjectName("secondary")
+        batch_btn.setCursor(Qt.PointingHandCursor)
+        batch_btn.setToolTip("编辑批次：订舱/提单、船期与线路、集装箱、客户货主")
+        batch_btn.clicked.connect(self._open_batch)
+        act_row.addWidget(batch_btn)
+
+        sched_btn = QPushButton("船期变更")
+        sched_btn.setObjectName("secondary")
+        sched_btn.setCursor(Qt.PointingHandCursor)
+        sched_btn.setToolTip("登记船期变更（A/B/C/D 自动重排 + 影响预览 + 历史）")
+        sched_btn.clicked.connect(self._open_schedule_change)
+        act_row.addWidget(sched_btn)
+
+        plan_btn = QPushButton("计划日期")
+        plan_btn.setObjectName("secondary")
+        plan_btn.setCursor(Qt.PointingHandCursor)
+        plan_btn.setToolTip("查看当前批次计划日期（§5.3 规则计算）")
+        plan_btn.clicked.connect(self._open_plan_date)
+        act_row.addWidget(plan_btn)
+
+        cust_btn = QPushButton("客户货主")
+        cust_btn.setObjectName("secondary")
+        cust_btn.setCursor(Qt.PointingHandCursor)
+        cust_btn.setToolTip("客户/货主主档管理与当前批次角色绑定")
+        cust_btn.clicked.connect(self._open_customer_master)
+        act_row.addWidget(cust_btn)
+
         cargo_btn = QPushButton("货物台账")
         cargo_btn.setObjectName("secondary")
         cargo_btn.setCursor(Qt.PointingHandCursor)
-        cargo_btn.setToolTip("查看 / 编辑货物清单，登记装箱箱号与封号")
+        cargo_btn.setToolTip("查看 / 编辑当前批次货物清单，登记装箱箱号与封号")
         cargo_btn.clicked.connect(self._open_cargo)
         act_row.addWidget(cargo_btn)
 
         vessel_btn = QPushButton("班轮 · 船位")
         vessel_btn.setObjectName("secondary")
         vessel_btn.setCursor(Qt.PointingHandCursor)
-        vessel_btn.setToolTip("维护船名/航次，手工登记船位与实际 ETA（可联动重排）")
+        vessel_btn.setToolTip("维护当前批次船名/航次，手工登记船位与实际 ETA")
         vessel_btn.clicked.connect(self._open_vessel)
         act_row.addWidget(vessel_btn)
         act_row.addStretch()
@@ -653,7 +964,8 @@ class ProjectCard(QFrame):
         undo_btn.setCursor(Qt.PointingHandCursor)
         undo_btn.setIcon(icon("undo", ACCENT, 14))
         undo_btn.setIconSize(QSize(14, 14))
-        has_hist = bool(db.get_shift_history(self._project["project_id"], limit=1))
+        has_hist = bool(db.get_shift_history(self._project["project_id"], limit=1,
+                                             batch_id=self._current_batch_id))
         undo_btn.setEnabled(has_hist)
         undo_btn.clicked.connect(self._undo_shift)
         act_row.addWidget(undo_btn)
@@ -735,7 +1047,8 @@ class ProjectCard(QFrame):
         step = self._step_spin.value() if self._step_spin else 1
         days = sign * step
         try:
-            res = apply_shift(self._project["project_id"], node_id, days)
+            res = apply_shift(self._project["project_id"], node_id, days,
+                              batch_id=self._current_batch_id)
         except ShiftError as e:
             QMessageBox.warning(self, "位移被拦截", str(e))
             return
@@ -744,12 +1057,38 @@ class ProjectCard(QFrame):
 
     def _undo_shift(self):
         try:
-            res = undo_last_shift(self._project["project_id"])
+            res = undo_last_shift(self._project["project_id"],
+                                  batch_id=self._current_batch_id)
         except ShiftError as e:
             QMessageBox.warning(self, "撤销被拦截", str(e))
             return
         self._flash_note = f"✓ {res['note']}"
         self._after_change()
+
+    def _open_batch(self):
+        from ui.batch_dialogs import BatchDialog
+        dlg = BatchDialog(self._project["project_id"], self._current_batch_id, self)
+        if dlg.exec():
+            self._batches = db.get_batches(self._project["project_id"])
+            self._load()
+            self._after_change()
+
+    def _open_schedule_change(self):
+        from ui.batch_dialogs import ScheduleChangeDialog
+        dlg = ScheduleChangeDialog(self._project["project_id"], self._current_batch_id, self)
+        if dlg.exec():
+            self._load()
+            self._after_change()
+
+    def _open_plan_date(self):
+        from ui.batch_dialogs import PlanDateDialog
+        dlg = PlanDateDialog(self._project["project_id"], self._current_batch_id, self)
+        dlg.exec()
+
+    def _open_customer_master(self):
+        from ui.batch_dialogs import CustomerMasterDialog
+        dlg = CustomerMasterDialog(self._current_batch_id, self)
+        dlg.exec()
 
     def _open_cargo(self):
         dlg = CargoDialog(self._project["project_id"], self)
@@ -766,18 +1105,49 @@ class ProjectCard(QFrame):
 
     def _toggle_file(self, file_id, checked):
         """勾选/取消单证 → 落库 + 原地刷新行（绝不重建面板，避免销毁信号发射者）"""
-        finfo = db.get_files(self._project["project_id"]) or []
+        finfo = db.get_files(self._project["project_id"], batch_id=self._current_batch_id) or []
         doc = next((f for f in finfo if f["file_id"] == file_id), {})
         doc_name = doc.get("doc_name", "")
         node_id = doc.get("node_id")
         if checked:
+            # ★ D32 硬阻断：必填客户角色/税号缺失时不得提交
+            from services import batches as bsv
+            missing = bsv.missing_roles(self._current_batch_id, doc_name)
+            proj = self._project
+            tax_missing = bsv.importer_tax_missing(self._current_batch_id, proj.get("country"))
+            if missing:
+                roles_cn = "、".join({"SHIPPER": "发货人", "CONSIGNEE": "收货人",
+                                      "IMPORTER": "进口商", "CUSTOMER": "客户"}.get(r, r)
+                                     for r in missing)
+                if self._file_panel is not None:
+                    self._file_panel.update_files(self._files, self._nodes)
+                ret = QMessageBox.warning(
+                    self, "客户资料缺失",
+                    f"「{doc_name}」缺少必填角色：{roles_cn}。\n"
+                    f"请先到「客户货主」补录资料并绑定到当前批次后再提交。",
+                    QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+                if ret == QMessageBox.Ok:
+                    self._open_customer_master()
+                self._flash_note = f"未提交：{doc_name} 缺客户资料"
+                return
+            if tax_missing and any(k in doc_name for k in
+                                   ("出口报关单", "进口证", "进口税费", "非自动进口许可证", "许可证")):
+                if self._file_panel is not None:
+                    self._file_panel.update_files(self._files, self._nodes)
+                QMessageBox.warning(
+                    self, "税号缺失",
+                    f"目的国要求进口商税号（CNPJ/CPF），请先在「客户货主」为进口商补录税号。")
+                self._flash_note = f"未提交：{doc_name} 缺进口商税号"
+                return
             db.update_file(file_id, status="submitted", submitted_date=db.today_str())
             _oplog("file_submit", self._project["project_id"], node_id=node_id,
-                   subject=doc_name, detail="提交")
+                   subject=doc_name, detail="提交", batch_id=self._current_batch_id,
+                   node_key=doc.get("node_key"))
         else:
             db.update_file(file_id, status="pending", submitted_date=None)
             _oplog("file_withdraw", self._project["project_id"], node_id=node_id,
-                   subject=doc_name, detail="撤交")
+                   subject=doc_name, detail="撤交", batch_id=self._current_batch_id,
+                   node_key=doc.get("node_key"))
         # 单证全交清 + 已过节点结束日 → 自动完成（反之回退）
         sync_doc_completion(self._project["project_id"])
         self._load()
@@ -785,7 +1155,8 @@ class ProjectCard(QFrame):
         self._update_chips()          # 仅刷新统计字牌
         if self._file_panel is not None:
             # ★ 原地增量刷新：只改这一行（及其节点状态），不销毁任何控件
-            self._file_panel.update_files(self._files, self._nodes)
+            self._file_panel.update_files(self._files, self._nodes,
+                                          batch_id=self._current_batch_id)
             if self._focused_node is not None:
                 self._file_panel.focus_node(self._focused_node)
         self._flash_note = f"✓ {'提交' if checked else '撤交'} {doc_name}"
@@ -891,7 +1262,10 @@ class DashboardPage(QWidget):
 
     def refresh(self):
         sync_active_projects()               # 进入看板时先同步「必填齐+已过期末」自动完成
-        self._projects = db.get_projects_by_status("Active")
+        # §D30/T32：全部批次被取消的项目状态为 Cancelled，必须**留在列表并标注「已取消」**，
+        # 不能因为只取 Active 而从看板消失。
+        self._projects = (db.get_projects_by_status("Active")
+                          + db.get_projects_by_status("Cancelled"))
         self._render_stats(self._collect_stats())
 
         # 清空列表

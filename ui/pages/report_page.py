@@ -3,6 +3,7 @@
 风格与全局一致（Apple 白色极简、圆角卡片、紧凑对齐、无 emoji）。
 流程：先「预览报告」只渲染不产文件 → 满意后「生成」弹确认框直接导出；
 两个按钮互不自动触发（职责分离）。
+两级口径（§11）：筛选链 项目 → 批次 → 客户；单批次报告标题带【项目名 · B01】。
 """
 
 from datetime import date, timedelta
@@ -80,7 +81,37 @@ class ReportPage(QWidget):
         row1.addWidget(QLabel("项目"))
         self.project_combo = QComboBox()
         self.project_combo.setFixedWidth(200)
+        self.project_combo.currentIndexChanged.connect(self._on_project_changed)
         row1.addWidget(self.project_combo)
+
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("批次"))
+        self.batch_combo = QComboBox()
+        self.batch_combo.setFixedWidth(190)
+        self.batch_combo.setToolTip("选「全部批次」= 全项目报告（标题保持原名）；"
+                                    "选具体批次 = 单批次报告（标题带【项目名 · B01】）")
+        row1.addWidget(self.batch_combo)
+
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("客户"))
+        self.customer_combo = QComboBox()
+        self.customer_combo.setFixedWidth(170)
+        row1.addWidget(self.customer_combo)
+
+        # §T30 报关要素筛选（报关行 / 报关方式）
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("报关行"))
+        self.broker_combo = QComboBox()
+        self.broker_combo.setFixedWidth(150)
+        self.broker_combo.setToolTip("按报关行筛选（T30：报关要素可筛选）")
+        row1.addWidget(self.broker_combo)
+
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("报关方式"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.setFixedWidth(130)
+        self.mode_combo.setToolTip("按报关方式筛选（一般贸易/买单/市场采购/跨境电商）")
+        row1.addWidget(self.mode_combo)
         row1.addStretch()
 
         self.brief_check = QCheckBox("简报模式（仅概览 + 未完成清单）")
@@ -129,6 +160,7 @@ class ReportPage(QWidget):
         outer.addWidget(self.preview, stretch=1)
 
         self._load_projects()
+        self._load_customers()
         self._sync_date_default()
 
     def _sync_date_default(self):
@@ -142,17 +174,93 @@ class ReportPage(QWidget):
         self._sync_date_default()
 
     def _load_projects(self):
+        self.project_combo.blockSignals(True)
         self.project_combo.clear()
         self.project_combo.addItem("全部项目", None)
-        for p in db.get_projects_by_status("Active"):
+        for p in db.get_projects_by_status("Active") + db.get_projects_by_status("Cancelled"):
             self.project_combo.addItem(p["project_name"], p["project_id"])
+        self.project_combo.blockSignals(False)
         # 保留此前选择
         last = self._selected_project()
         if last is None:
             self.project_combo.setCurrentIndex(0)
+        self._load_batches()
+        self._load_customers()
+        self._load_customs()
+
+    def _load_batches(self):
+        """批次下拉（§11 二级口径）：全部批次 / 各启用批次。
+
+        已取消批次按 §8/D14 全模块隐藏，需查审计请走批次列表的「显示已取消」开关。
+        """
+        self.batch_combo.blockSignals(True)
+        self.batch_combo.clear()
+        self.batch_combo.addItem("全部批次", None)
+        for pid in self._project_ids():
+            for b in db.get_batches(pid):
+                self.batch_combo.addItem(reporting.batch_label(b), b["batch_id"])
+        self.batch_combo.setCurrentIndex(0)
+        self.batch_combo.blockSignals(False)
+
+    def _load_customers(self):
+        """客户下拉（§5.5 D32 / §11）：全部客户 / 未填写 / 单客户。"""
+        cur = self.customer_combo.currentData() if self.customer_combo.count() else None
+        self.customer_combo.blockSignals(True)
+        self.customer_combo.clear()
+        for opt in reporting.customer_options():
+            self.customer_combo.addItem(opt["name"], opt["id"])
+        for i in range(self.customer_combo.count()):
+            if self.customer_combo.itemData(i) == cur:
+                self.customer_combo.setCurrentIndex(i)
+                break
+        self.customer_combo.blockSignals(False)
+
+    def _load_customs(self):
+        """§T30 报关要素下拉：报关行 / 报关方式（含「全部」）。"""
+        from services import customs_stats as cs
+        for combo, opts in ((self.broker_combo, cs.customs_broker_options()),
+                            (self.mode_combo, cs.customs_mode_options())):
+            cur = combo.currentData() if combo.count() else None
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("全部", None)
+            for o in opts or []:
+                if o.get("value") is None:
+                    continue
+                combo.addItem(o["label"], o["value"])
+            for i in range(combo.count()):
+                if combo.itemData(i) == cur:
+                    combo.setCurrentIndex(i)
+                    break
+            combo.blockSignals(False)
+
+    def _selected_broker(self):
+        return self.broker_combo.currentData() if self.broker_combo.count() else None
+
+    def _selected_customs_mode(self):
+        return self.mode_combo.currentData() if self.mode_combo.count() else None
+
+    def _project_ids(self):
+        pid = self._selected_project()
+        if pid:
+            return [pid]
+        return [p["project_id"]
+                for p in db.get_projects_by_status("Active")
+                + db.get_projects_by_status("Cancelled")]
+
+    def _on_project_changed(self, *_):
+        self._load_batches()
+        self._load_customers()
+        self._load_customs()
 
     def _selected_project(self):
         return self.project_combo.currentData()
+
+    def _selected_batch(self):
+        return self.batch_combo.currentData() if self.batch_combo.count() else None
+
+    def _selected_customer(self):
+        return self.customer_combo.currentData() if self.customer_combo.count() else None
 
     # ── 报告模型 ──
 
@@ -171,7 +279,11 @@ class ReportPage(QWidget):
                      else report_exporter.peek_report_no(ref))
         return reporting.build_report(kind, ref, project_filter=project_filter,
                                       brief=self.brief_check.isChecked(),
-                                      report_no=report_no)
+                                      report_no=report_no,
+                                      batch_filter=self._selected_batch(),
+                                      customer_filter=self._selected_customer(),
+                                      customs_broker=self._selected_broker(),
+                                      customs_mode=self._selected_customs_mode())
 
     # ── 预览（只渲染，不产文件、不占用编号） ──
 
@@ -192,6 +304,8 @@ class ReportPage(QWidget):
         blocks = self._blocks_for(model)
         wc_note = ""
         m_c = model["overview"]["project_count"]
+        b_c = model["overview"].get("batch_count", 0)
+        batch_txt = f" · {b_c} 个批次" if b_c else ""
         e_count = len(model["unfinished"])
         e_txt = f", {e_count} 项逾期" if e_count else "，无逾期"
         range_txt = model["range_text"]
@@ -202,7 +316,8 @@ class ReportPage(QWidget):
         confirm.setWindowTitle("生成报告")
         confirm.setText(
             f"将生成 {model['kind']}报告：{model['title']}\n"
-            f"范围 {range_txt} · 包含 {m_c} 个项目{e_txt}{wc_note}。\n"
+            f"范围 {range_txt} · 包含 {m_c} 个项目{batch_txt}{e_txt}{wc_note}。\n"
+            f"筛选：{model['project_filter_label']}\n"
             f"编号：{model['report_no']}\n确认导出吗？")
         ok = confirm.addButton("确认生成", QMessageBox.AcceptRole)
         confirm.addButton("取消", QMessageBox.RejectRole)

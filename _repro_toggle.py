@@ -27,8 +27,38 @@ for n in DEMO_NODES:
 db.insert_nodes(pid, nodes)
 db.insert_files(pid, bootstrap(DEMO_PROJECT["country"], DEMO_PROJECT["export_port"], plan))
 
+# ── D32 提交前置：客户角色 + 目的国税号 ──
+# 勾选单证会走真实提交链路；资料不齐时产品会弹「客户资料缺失/税号缺失」模态框，
+# 离屏无人点击 → 脚本会永久阻塞。故先按真实使用场景把角色/税号备齐，
+# 让勾选路径落到「提交成功」分支（这正是本回归要覆盖的链路）。
+bid = db.current_batch_id(pid)
+_shipper = db.insert_party(party_name="青岛腾达物流有限公司", country="CN",
+                           roles=["SHIPPER"])
+_consignee = db.insert_party(party_name="Sepetiba Energia Ltda", country="BR",
+                             roles=["CONSIGNEE"])
+_importer = db.insert_party(party_name="BR Importadora Ltda", country="BR",
+                            tax_id="12.345.678/0001-90", tax_id_type="CNPJ",
+                            roles=["IMPORTER"])
+db.set_batch_parties(bid, "SHIPPER", [_shipper])
+db.set_batch_parties(bid, "CONSIGNEE", [_consignee])
+db.set_batch_parties(bid, "IMPORTER", [_importer])
+
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
 app = QApplication(sys.argv)
+
+# 看门狗：本回归的核心诉求是「不再卡死」。若将来又出现模态弹窗（如资料缺失阻断）
+# 或信号回环死循环，脚本必须**以失败退出**而不是无限挂起，因此 120s 兜底强杀。
+WATCHDOG_MS = 120000
+
+
+def _watchdog():
+    print("FAIL  看门狗超时（120s）：出现模态弹窗或阻塞 → 强制失败退出，绝不挂死")
+    os._exit(2)
+
+
+QTimer.singleShot(WATCHDOG_MS, _watchdog)
+
 from ui.theme import GLOBAL_QSS, APP_FONT, APP_FONT_SIZE, ensure_check_asset
 from PySide6.QtGui import QFont
 app.setFont(QFont(APP_FONT, APP_FONT_SIZE))
@@ -61,6 +91,12 @@ def check(cond, msg):
 fp = card._file_panel
 rows = [r for r, _ in fp._row_order]
 print(f"文件行数 = {len(rows)}  节点数 = {len(card._nodes)}")
+
+# 前置：D32 校验已满足 → 勾选会走「提交成功」分支而非弹窗阻断
+from services import batches as _bsvc
+check(not _bsvc.missing_roles(bid, "出口报关单")
+      and not _bsvc.importer_tax_missing(bid, DEMO_PROJECT["country"]),
+      "客户角色/税号齐备（D32 提交前置已满足，勾选走真实提交路径）")
 
 print("\n== 逐个勾选（模拟用户点击 checkbox）==")
 times = []

@@ -6,6 +6,97 @@
 
 ---
 
+## 多式联运批次化升级（v7.0 · 对照《多式联运.md》V3.2）
+
+按 `多式联运.md` 一期方案（1A 数据层 → 1B 提醒升级 → 1C 报告 KPI）落地，
+**T1–T40 验收用例全部通过**（`python tools/test_acceptance_all.py`）。
+
+### 数据层（1A）
+
+| 新增/改造 | 说明 |
+| :-- | :-- |
+| `batches` / `batch_routes` | 批次 = 一次订舱 + 一次发运；线路方案含 `mode_primary/mode_chain`、出发港、ETD/ETA、船、报关行/方式、换单方式、免堆期/免箱期 |
+| `containers` / `container_batch_link` | 1 批次 N 柜；多对多表一期恒 `PRIMARY`，二期启用 `SHARED`（共柜/拼箱） |
+| `parties` / `party_roles` / `batch_parties` | 客户/货主主档 + 多角色绑定；`NOTIFY` 支持多条 |
+| `batch_schedule_changes` / `batch_route_changes` | 船期变更留痕 / 换线留痕（含影响清单 JSON） |
+| `doc_types` / `reminder_rules` / `doc_dependencies` | §10.1 单证字典、§10.2 多维度提前量规则、§10.3 依赖链 |
+| `insurance_policies` | §3.10 保险单（保险公司/保单号/保额/起止日 → 保险到期提醒） |
+| `migration_status` | §6.9 迁移状态表 |
+| `nodes` 主键重建 | 改 `(batch_id, node_id)`，唯一键 `(batch_id, node_key)`；**规则一律按 `node_key` 定位** |
+
+### 规则与算法
+
+- **`services/node_template.py`**：15 节点海运模板（`EMPTY_PICKUP` … `EMPTY_RETURN`），
+  含旧 12 节点 → 新 `node_key` 映射表；吊装预警 / 缓冲提示 / 海运锚点 / `actual_*` 推导
+  全部改用 `node_key` 常量。
+- **`services/schedule2.py`**：节点计划日期唯一算法（§5.3）——境内倒排、境外顺排、
+  海运 `duration = ETA − ETD`；`NATURAL` / `WORKDAY`（跳过周末）日历模式；
+  冻结保护（`Done`/已填实际完成日不重算）；唯一入口 `recompute_batch_schedule()`，
+  只把发生变化的行为写 `op_log(kind='schedule_recompute')`。
+- **`services/schedule_change.py`**：船期变更 A/B/C/D 四类自动重排（§5.4），
+  带**影响预览**（判定类、逐节点日期变化、单证 due 变化、冻结冲突三选项、免箱期复核提示）；
+  联动重算单证 `due_date` 与申报截止；只写 `batch_schedule_changes` + `op_log`，
+  **不写 `shift_history`**（保证「撤销上一步位移」只撤人工位移）。
+- **`services/batches.py`**：批次状态机 `draft→ready→running→completed→closed`（+`cancelled`）；
+  `completed` **需人工确认**；取消可恢复（记 `previous_status`，从 `completed` 恢复回到
+  `running` 并重新触发确认）；换线影响清单；复制批次（冻结模板快照，不带状态/日志/完成日期）。
+- **`services/validation.py`**：§6.8 数据质量 13 项校验，分**阻断级**与**提示级**——
+  缺客户角色/税号只阻断**相关单证提交**（§5.5），不阻断批次保存（§5.5.4 不回溯阻断）。
+- **`services/modes.py`**：§9 占位红线——仅 `SEA` 启用，其余 6 种方式下拉置灰
+  「后续开放」且**后端双重校验拒绝**。
+- **`services/timezone_helper.py`**：§6.6/D21 全系统统一北京时间；时间戳存
+  `2026-09-10T14:30:00+08:00`；港口 `port_timezone_offset` 与「当地时间 → 北京时间」
+  换算辅助（仅提示，不参与计算）。
+
+### 提醒与报告（1B / 1C）
+
+- **§10.2 多维度提前量**：规则键 `(单证类型, 目的国, 承运人)`，回落链
+  精确 → 目的国默认 → 承运人默认 → 单证类型默认 → 全局默认；支持**小时级**截止
+  （AMS 装船前 24h、ISF 48h、ENS 24h）与**基准来源备注**留证。
+- **§10.1 单证字典**：补 `HBL/SWB/电放保函/AMS/ISF/ENS/核销单/订舱委托/SO/VGM` 等。
+- **§10.3 依赖链**：`MBL→HBL`、`报关单→装船`、`保险单→装船`、`到货通知→D/O`、`D/O→提货`；
+  上游未满足时下游单证标灰并显示「待上游：《MBL》」；**甘特中对应节点同步标黄「待上游」**（§10.5）；
+  依赖视图 = 列表缩进树 + QPainter 连线图（下游恒画在上游右侧）；依赖链带**无环校验**（§15）。
+- **§10.4 时效提醒**：免箱期/免堆期倒计时（前 3 天 P1 / 前 1 天及到期超期 **P0 且置顶**）、
+  到货通知、保险到期（30/15/7/3/1/0 天梯度）、申报截止（AMS/ISF/ENS 按装船前 N 小时）。
+- **§11 报告两级口径**：单批次标题 `【项目名 · B01】`（仅选批次也会反解项目名，不退化为日期制式）；
+  批次列/客户列/柜号列；概览双标（项目数/批次数）；**项目→批次→客户→报关行/报关方式**多维筛选；
+  `_B01` 文件名后缀；批次 KPI（按时率、平均周期、单证按时提交率、免箱期超期占比、
+  船期变更次数/平均影响天数/变更后新增逾期数）；数据不足显示「数据不足」而非 0。
+- **§12 UI**：批次列表「N 批次 · 风险汇总」+ 新增/复制批次入口；批次管理对话框；
+  客户/货主主档管理；船期变更登记与影响预览；计划日期只读视图；
+  「显示已取消」审计开关；换线影响清单；**提醒中心**（按批次分组 + 三级汇总）、
+  **依赖视图**页（今日待办弹窗内）。
+
+### 迁移（§7）
+
+`tools/migrate_batches.py --check | --apply | --rollback`：备份 → 文件锁
+`data/.migrate.lock` → `migration_status` → 建表/加列 → `nodes` 主键重建 →
+生成 `project_no` 与默认批次 `B01` → 回填 `batch_id` → 模板升级（12→15 节点，
+新增节点补 `Pending`）→ 集装箱迁移 → 时区统一 → 校验 → `schema_version=2`。
+幂等（重复执行只补缺）、失败整事务回滚并保留 `.bak`。
+`--check` 现在同时执行 §6.8 数据质量校验。
+
+### 验收
+
+```powershell
+python tools/test_acceptance_all.py     # T1–T40 总验收（隔离临时库）
+python tools/test_acceptance_1a.py      # 1A：T35–T40
+python tools/test_acceptance_1b.py      # 1B：T10/T17/T18/T30
+python tools/test_acceptance_1c.py      # 1C：T9/T20/T21/T29
+python tools/test_migrate.py            # T1/T11/T23 迁移六步
+python _audit/run_tests.py              # 全量回归（_opt_* / _verify_* / 冒烟，18 个脚本）
+```
+
+`_audit/` 为实施期核查脚手架：`run_tests.py`（回归运行器，T12 依赖它）与
+`verify_*.py` / `check_*.py`（分项实证，全部 FAILED: 0）。
+其中 `verify_real_db_upgrade.py` 会复制真实库做「app 启动路径」无损升级验证。
+
+> Windows 控制台下若出现 GBK 编码报错，请加 `$env:PYTHONUTF8='1'`；
+> 离屏跑 UI 脚本请设 `$env:QT_QPA_PLATFORM='offscreen'`。
+
+---
+
 ## 本次优化（v6.7）
 
 ### 1. 统一时钟：模拟时间下所有入库时间戳跟随模拟日期

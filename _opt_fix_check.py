@@ -71,7 +71,7 @@ check(card._file_panel is fp and fp._row_order[0][0] is row_before,
 card._toggle_right(); app.processEvents()
 check(card._right_collapsed is True, "可收起右栏")
 fid2 = next(f["file_id"] for f in db.get_files(pid)
-            if f.get("node_id") == 1 and f["doc_type"] == "required" and f["file_id"] != fid1)
+            if f["doc_type"] == "required" and f["file_id"] != fid1)
 card._toggle_file(fid2, True); app.processEvents()
 check(card._right_collapsed is True, "收起状态提交单证后不被自动展开")
 

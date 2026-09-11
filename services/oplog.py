@@ -18,10 +18,13 @@ import db
 
 # 白名单：仅这些 kind 允许落库
 WHITELIST = {
-    "project_create", "project_close",
+    "project_create", "project_close", "batch_create", "batch_cancel", "batch_restore",
+    "batch_complete_confirm", "batch_close",
     "node_shift", "node_unshift", "node_done",
     "file_submit", "file_withdraw",
     "vessel_position", "cargo_edit",
+    "schedule_recompute", "batch_schedule_change", "batch_actual_override",
+    "route_change", "party_edit",
 }
 
 # 单证类（同项目·同单证·同日只留一行最终态）
@@ -49,10 +52,10 @@ def display_detail(detail):
 
 def _now(created_at):
     if created_at:
-        return created_at
-    # 走统一时钟：模拟时间生效时日志时间戳跟随模拟日期，避免与节点判定错位
-    from services.clock import get_now_str
-    return get_now_str("%Y-%m-%d %H:%M")
+        # §6.6：归一为 ISO 8601 +08:00（调用方可能传 'YYYY-MM-DD HH:MM'）
+        return db.normalize_ts(created_at)
+    # 走统一时钟；时间戳格式统一为 ISO 8601 +08:00（§6.6）
+    return db._now()
 
 
 def _day(created_at):
@@ -71,7 +74,7 @@ def _nets_of_day(project_id, kind, subject, day):
 
 
 def record(kind, project_id, node_id=None, subject="", detail="",
-           delta=None, created_at=None):
+           delta=None, created_at=None, batch_id=None, node_key=None, scope="batch"):
     """
     统一入口。返回新行 id；未到白名单 / 当日净 0 收敛时不落库返回 None。
     delta 仅供 node_shift 收敛计算（正=推迟，负=提前）。
@@ -88,7 +91,8 @@ def record(kind, project_id, node_id=None, subject="", detail="",
                           "subject": subject, "created_day": day})
         return db.insert_op_log(project_id, kind, subject=subject,
                                 detail=detail or ("提交" if kind == "file_submit" else "撤交"),
-                                node_id=node_id, created_at=created_at)
+                                node_id=node_id, batch_id=batch_id, node_key=node_key,
+                                scope=scope, created_at=created_at)
 
     # ── 主动位移：当日净收敛（净 0 不记）──
     if kind == "node_shift":
@@ -101,10 +105,10 @@ def record(kind, project_id, node_id=None, subject="", detail="",
             return None  # 当日净 0：不记
         detail = f"{detail or ''} [D{new_net:+d}]"
         return db.insert_op_log(project_id, "node_shift", subject=subject,
-                                detail=detail.strip(), node_id=node_id,
-                                created_at=created_at)
+                                detail=detail.strip(), node_id=node_id, batch_id=batch_id,
+                                node_key=node_key, scope=scope, created_at=created_at)
 
     # ── 其余动作：直接追加 ──
     return db.insert_op_log(project_id, kind, subject=subject,
-                            detail=detail or "", node_id=node_id,
-                            created_at=created_at)
+                            detail=detail or "", node_id=node_id, batch_id=batch_id,
+                            node_key=node_key, scope=scope, created_at=created_at)

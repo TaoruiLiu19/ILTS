@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QDateEdit,
     QGroupBox, QFormLayout, QMessageBox, QListWidget, QDoubleSpinBox,
-    QScrollArea, QFrame, QWidget
+    QScrollArea, QFrame, QWidget, QTabWidget, QComboBox
 )
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtGui import QColor
@@ -486,13 +486,16 @@ class TodayTodoDialog(QDialog):
                ("P1", "进行中提醒", "#FF9500"),
                ("P2", "今日启动", "#007AFF"))
 
-    def __init__(self, all_reminders, today, parent=None):
+    def __init__(self, all_reminders, today, parent=None, batch_ids=None,
+                 with_dependency=True):
         super().__init__(parent)
         self.setWindowTitle("今日待办")
         self.setMinimumWidth(500)
         self.setMaximumWidth(560)
         self._all = all_reminders
         self._today = today
+        self._batch_ids = batch_ids
+        self._with_dependency = with_dependency
         self._build()
 
     def _build(self):
@@ -575,7 +578,18 @@ class TodayTodoDialog(QDialog):
         body_lay.addStretch()
         scroll.setWidget(body)
         scroll.setMaximumHeight(360)
-        lay.addWidget(scroll, 1)
+
+        # ── §10.3 依赖等待 / 依赖视图（次级标签；无依赖数据时不显示） ──
+        dep_page = self._build_dependency_page() if self._with_dependency else None
+        if dep_page is not None:
+            tabs = QTabWidget()
+            tabs.setDocumentMode(True)
+            tabs.addTab(scroll, "按优先级")
+            tabs.addTab(dep_page, "依赖视图")
+            lay.addWidget(tabs, 1)
+            self._tabs = tabs
+        else:
+            lay.addWidget(scroll, 1)
 
         # ── 底部：关闭 ──
         foot = QHBoxLayout()
@@ -588,6 +602,59 @@ class TodayTodoDialog(QDialog):
         foot.addStretch()
         foot.addWidget(close_btn)
         lay.addLayout(foot)
+
+    # ── §10.3 依赖视图页 ──
+
+    def _batch_ids_in_reminders(self):
+        """从提醒条目里收集涉及的批次（保持出现顺序，去重）。"""
+        ids = list(self._batch_ids or [])
+        for level, _n, _c in self._GROUPS:
+            for r in self._all.get(level, []) or []:
+                bid = r.get("batch_id")
+                if bid and bid not in ids:
+                    ids.append(bid)
+        return ids
+
+    def _build_dependency_page(self):
+        """构建依赖视图页；无批次或无依赖数据时返回 None（不显示标签）。"""
+        bids = self._batch_ids_in_reminders()
+        if not bids:
+            return None
+        from ui.widgets.dependency_view import DependencyView
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(2, 6, 8, 6)
+        v.setSpacing(8)
+
+        self._dep_batch_combo = None
+        if len(bids) > 1:
+            row = QHBoxLayout()
+            row.addWidget(QLabel("批次"))
+            combo = QComboBox()
+            for bid in bids:
+                b = db.get_batch(bid) or {}
+                combo.addItem(f"{b.get('batch_no') or bid}", bid)
+            combo.currentIndexChanged.connect(self._on_dep_batch_changed)
+            row.addWidget(combo)
+            row.addStretch()
+            v.addLayout(row)
+            self._dep_batch_combo = combo
+
+        self._dep_view = DependencyView(bids[0])
+        v.addWidget(self._dep_view, 1)
+        return page
+
+    def _on_dep_batch_changed(self, idx):
+        if self._dep_batch_combo is None or not hasattr(self, "_dep_view"):
+            return
+        self._dep_view.set_batch(self._dep_batch_combo.itemData(idx))
+
+    def dependency_model(self):
+        """供自测读取当前依赖模型。"""
+        return self._dep_view.model() if hasattr(self, "_dep_view") else None
+
+    def dependency_waiting_texts(self):
+        return self._dep_view.waiting_texts() if hasattr(self, "_dep_view") else []
 
     def _row_card(self, project, msg):
         from ui.theme import CARD, BORDER, TEXT_PRIMARY, TEXT_SECONDARY

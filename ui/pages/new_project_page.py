@@ -1,25 +1,28 @@
 """
-页面三：新建项目录入页 — 国家/出口港下拉 + 节点列表 + 货物台账 + 班轮信息 + 保存
+页面三：新建项目录入页 — 国家/出口港 + 批次信息 + 线路模式选择 + 复制模板 + 节点列表 + 货物台账 + 班轮信息 + 保存
+保持 Apple 极简风格，无 emoji
 """
 
 from datetime import date
 from uuid import uuid4
 
 from services.clock import get_today
+from services.node_template import template as full_template
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QDateEdit, QComboBox, QSpinBox, QDoubleSpinBox,
     QScrollArea, QFrame, QGroupBox, QFormLayout,
-    QDialog, QTreeWidget, QTreeWidgetItem
+    QDialog, QDialogButtonBox
 )
-from PySide6.QtCore import Qt, Signal, QDate, QSize
-from PySide6.QtGui import QFont, QStandardItemModel, QStandardItem
+from PySide6.QtCore import Qt, Signal, QSize, QDate
+from PySide6.QtGui import QFont
 
 import db
 from config import COUNTRIES, PORTS, get_country, get_port
 from services.ports import search_ports, list_tree, merge_node_notes, platform_note
-from services.scheduler import generate_schedule
+from services.schedule2 import compute_plan
+from services import modes as mode_names
 from services.file_checklist import bootstrap
 from services.cargo_check import normalize_item, item_over_types, summary
 from ui.theme import (
@@ -169,6 +172,7 @@ class NewProjectPage(QWidget):
         super().__init__(parent)
         self._node_widgets = {}
         self._cargo_rows = []
+        self._from_template_project_id = None
         self._build()
 
     def _build(self):
@@ -187,13 +191,38 @@ class NewProjectPage(QWidget):
         title.setObjectName("title")
         layout.addWidget(title)
 
-        sub = QLabel("填写基本信息，系统将自动生成节点排期与单证清单")
+        sub = QLabel("填写基本信息与批次信息，系统将自动生成节点排期与单证清单")
         sub.setObjectName("subtitle")
         layout.addWidget(sub)
 
+        # ── 复制模板 ──
+        copy_group = QGroupBox("从现有项目复制模板")
+        copy_layout = QHBoxLayout(copy_group)
+        copy_layout.setContentsMargins(20, 16, 20, 16)
+        copy_layout.setSpacing(12)
+
+        self.copy_combo = QComboBox()
+        self.copy_combo.setMinimumWidth(360)
+        self.copy_combo.addItem("不复制 → 新建空白模板", None)
+        self._fill_project_list()
+        self.copy_combo.currentIndexChanged.connect(self._on_copy_selected)
+        copy_layout.addWidget(self.copy_combo)
+
+        self.copy_btn = QPushButton("加载模板")
+        self.copy_btn.setObjectName("ghost")
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_btn.clicked.connect(self._load_template)
+        copy_layout.addWidget(self.copy_btn)
+
+        copy_note = QLabel("将复制原项目的节点耗时、货物台账、出口港设置；需重新填写ETD/ETA/批次信息")
+        copy_note.setStyleSheet(f"font-size: 12px; color: {TEXT_TERTIARY};")
+        copy_layout.addStretch()
+        layout.addWidget(copy_group)
+        layout.addWidget(copy_note)
+
         # ── 基本信息 ──
-        form_group = QGroupBox("基本信息")
-        form_layout = QFormLayout(form_group)
+        base_group = QGroupBox("基本信息")
+        form_layout = QFormLayout(base_group)
         form_layout.setLabelAlignment(Qt.AlignRight)
         form_layout.setContentsMargins(20, 20, 20, 20)
         form_layout.setHorizontalSpacing(18)
@@ -237,47 +266,101 @@ class NewProjectPage(QWidget):
         self.name_edit.setMaxLength(50)
         form_layout.addRow("项目名称", self.name_edit)
 
-        today = get_today()
-        self.etd_edit = QDateEdit()
-        self.etd_edit.setCalendarPopup(True)
-        self.etd_edit.setDate(QDate(today.year, today.month, today.day))
-        self.etd_edit.setDisplayFormat("yyyy-MM-dd")
-        form_layout.addRow("ETD 离港", self.etd_edit)
-
-        self.eta_edit = QDateEdit()
-        self.eta_edit.setCalendarPopup(True)
-        self.eta_edit.setDate(QDate(today.year, today.month, today.day).addDays(46))
-        self.eta_edit.setDisplayFormat("yyyy-MM-dd")
-        form_layout.addRow("ETA 到港", self.eta_edit)
-
         self.buffer_spin = QSpinBox()
         self.buffer_spin.setRange(0, 30)
         self.buffer_spin.setValue(4)
         form_layout.addRow("缓冲天数", self.buffer_spin)
 
-        layout.addWidget(form_group)
+        layout.addWidget(base_group)
 
-        # ── 高级排程参数 ──
+        # ── 批次信息（新增要求） ──
+        batch_group = QGroupBox("批次信息")
+        batch_form = QFormLayout(batch_group)
+        batch_form.setLabelAlignment(Qt.AlignRight)
+        batch_form.setContentsMargins(20, 20, 20, 20)
+        batch_form.setHorizontalSpacing(18)
+        batch_form.setVerticalSpacing(14)
+
+        # 线路模式选择（§9 占位红线）：仅 SEA 可选，其余置灰「后续开放」，
+        # 且后端 services.modes.validate_route_modes 双重校验拒绝。
+        self.mode_combo = QComboBox()
+        _model = self.mode_combo.model()
+        for text, key, enabled in mode_names.combo_choices():
+            self.mode_combo.addItem(text, key)
+            if not enabled:
+                idx = self.mode_combo.count() - 1
+                _model.item(idx).setEnabled(False)   # 置灰
+        self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.setToolTip("一期仅启用纯海运；空运/公路/铁路/联运为后续阶段能力，不可选")
+        batch_form.addRow("运输线路", self.mode_combo)
+
+        self.batch_no_edit = QLineEdit()
+        self.batch_no_edit.setPlaceholderText("自动生成：项目号-B01，可修改")
+        self.batch_no_edit.setMaxLength(20)
+        batch_form.addRow("批次号", self.batch_no_edit)
+
+        self.batch_name_edit = QLineEdit()
+        self.batch_name_edit.setPlaceholderText("批次名称（可选）")
+        self.batch_name_edit.setMaxLength(40)
+        batch_form.addRow("批次名称", self.batch_name_edit)
+
+        self.booking_no_edit = QLineEdit()
+        self.booking_no_edit.setPlaceholderText("订舱单号")
+        self.booking_no_edit.setMaxLength(30)
+        batch_form.addRow("订舱号", self.booking_no_edit)
+
+        self.mbl_no_edit = QLineEdit()
+        self.mbl_no_edit.setPlaceholderText("MBL 主提单号")
+        self.mbl_no_edit.setMaxLength(30)
+        batch_form.addRow("MBL 号", self.mbl_no_edit)
+
+        # 批次全程 ETD/ETA → 由这里统一输入，项目级不再保存，仅兼容
+        today = get_today()
+        self.batch_etd_edit = QDateEdit()
+        self.batch_etd_edit.setCalendarPopup(True)
+        self.batch_etd_edit.setDate(QDate(today.year, today.month, today.day))
+        self.batch_etd_edit.setDisplayFormat("yyyy-MM-dd")
+        self.batch_etd_edit.dateChanged.connect(self._update_preview)
+        batch_form.addRow("ETD 离港（批次）", self.batch_etd_edit)
+
+        self.batch_eta_edit = QDateEdit()
+        self.batch_eta_edit.setCalendarPopup(True)
+        self.batch_eta_edit.setDate(QDate(today.year, today.month, today.day).addDays(46))
+        self.batch_eta_edit.setDisplayFormat("yyyy-MM-dd")
+        self.batch_eta_edit.dateChanged.connect(self._update_preview)
+        batch_form.addRow("ETA 到港（批次）", self.batch_eta_edit)
+
+        # §6.6/D21 录入辅助：当地时间 → 北京时间换算提示 + 港口时区偏移（仅提示不参与计算）
+        self.tz_hint = QLabel("")
+        self.tz_hint.setWordWrap(True)
+        self.tz_hint.setStyleSheet("font-size: 11px; color: #8A8A8E;")
+        batch_form.addRow("", self.tz_hint)
+        self.batch_etd_edit.dateChanged.connect(self._refresh_tz_hint)
+        self.batch_eta_edit.dateChanged.connect(self._refresh_tz_hint)
+
+        layout.addWidget(batch_group)
+
+        # ── 节点排期 ──
         self.schedule_group = QGroupBox("节点排期")
         self.schedule_layout = QVBoxLayout(self.schedule_group)
         self.schedule_layout.setContentsMargins(12, 16, 12, 12)
         self.schedule_layout.setSpacing(0)
 
-        hint = QLabel("调整耗时后系统将重算所有节点起止日期与单证建议日")
+        hint = QLabel("调整耗时后系统将重算所有节点起止日期，基于批次 ETD/ETA")
         hint.setStyleSheet(f"font-size: 12px; color: {TEXT_TERTIARY}; padding: 0 8px 10px 8px;")
         self.schedule_layout.addWidget(hint)
         layout.addWidget(self.schedule_group)
 
         self._build_node_rows()
 
-        # ── 货物台账（优化方案 D1 §2.4） ──
+        # ── 货物台账 ──
         cargo_group = QGroupBox("货物台账（可选）")
         cargo_layout = QVBoxLayout(cargo_group)
         cargo_layout.setContentsMargins(16, 18, 16, 16)
         cargo_layout.setSpacing(8)
 
         head_row = QHBoxLayout()
-        cargo_hint = QLabel("登记每件设备的尺寸 / 毛重；超重（>100t）或超长（>36m）将触发节点3「捆扎固定」吊装预警")
+        cargo_hint = QLabel("登记每件设备的尺寸 / 毛重；超重（>100t）或超长（>36m）将触发节点「装箱/加固」吊装预警")
         cargo_hint.setStyleSheet(f"font-size: 12px; color: {TEXT_TERTIARY};")
         cargo_hint.setWordWrap(True)
         head_row.addWidget(cargo_hint, stretch=1)
@@ -322,7 +405,7 @@ class NewProjectPage(QWidget):
         cargo_layout.addWidget(self.cargo_summary)
         layout.addWidget(cargo_group)
 
-        # ── 班轮信息（优化方案 D1 §2.2，1 项目 1 船） ──
+        # ── 班轮信息（可选） ──
         vessel_group = QGroupBox("班轮信息（可选）")
         vessel_form = QFormLayout(vessel_group)
         vessel_form.setLabelAlignment(Qt.AlignRight)
@@ -363,6 +446,7 @@ class NewProjectPage(QWidget):
         self.preview_label = QLabel("")
         layout.addWidget(self.preview_label)
         self._update_preview()
+        self._refresh_tz_hint()
 
         # ── 按钮 ──
         btn_row = QHBoxLayout()
@@ -387,7 +471,113 @@ class NewProjectPage(QWidget):
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
-    def _build_node_rows(self):
+    def _fill_project_list(self):
+        """下拉列表填充已有项目供复制（§D30/T32：含「已取消」项目，留在列表）"""
+        projects = (db.get_projects_by_status("Active")
+                    + db.get_projects_by_status("Completed")
+                    + db.get_projects_by_status("Cancelled"))
+        for p in projects:
+            tag = "（已取消）" if p.get("status") == "Cancelled" else ""
+            label = f"{p['project_no']} {p['project_name'][:30]}{tag}"
+            self.copy_combo.addItem(label, p["project_id"])
+
+    def _rebuild_copy_list(self):
+        """重建复制下拉（清空后重填），保留当前选择项。"""
+        current = self._from_template_project_id
+        blocked = self.copy_combo.blockSignals(True)
+        self.copy_combo.clear()
+        self.copy_combo.addItem("不复制 → 新建空白模板", None)
+        self._fill_project_list()
+        if current is not None:
+            idx = self.copy_combo.findData(current)
+            if idx >= 0:
+                self.copy_combo.setCurrentIndex(idx)
+                self._from_template_project_id = current
+            else:
+                self._from_template_project_id = None
+        else:
+            self._from_template_project_id = None
+        self.copy_combo.blockSignals(blocked)
+        self.copy_btn.setEnabled(self._from_template_project_id is not None)
+
+    def _on_copy_selected(self):
+        """下拉选中变灰按钮直到点击加载"""
+        self._from_template_project_id = self.copy_combo.currentData()
+        has_selection = self._from_template_project_id is not None
+        self.copy_btn.setEnabled(has_selection)
+
+    def _load_template(self):
+        """加载现有项目模板 → 复制节点耗时、货物台账、出口港等，ETD/ETA/批次留空让用户填"""
+        pid = self._from_template_project_id
+        if not pid:
+            return
+
+        proj = db.get_project(pid)
+        if not proj:
+            self.toast.emit("未找到源项目")
+            return
+
+        bid = db.current_batch_id(pid)
+        nodes_old = db.get_nodes_by_batch(bid)
+        cargo_old = db.get_cargo_items(pid, bid)
+
+        # 回填基本信息
+        self.name_edit.setText(proj["project_name"] + " 副本")
+        self.buffer_spin.setValue(proj.get("buffer_days", 4))
+
+        # 国家
+        code = proj.get("country", "BR")
+        idx = self.country_combo.findData(code)
+        if idx >= 0:
+            self.country_combo.setCurrentIndex(idx)
+
+        # 出口港
+        pkey = proj.get("export_port")
+        if pkey:
+            model = self.port_combo.model()
+            for r in range(model.rowCount()):
+                it = model.item(r)
+                if it.data(Qt.UserRole) == pkey:
+                    self.port_combo.setCurrentIndex(r)
+                    break
+
+        # 节点耗时：用原耗时覆盖模板默认值
+        duration_map = {n["node_key"]: n["duration"] for n in nodes_old}
+        self._build_node_rows(duration_map)
+
+        # 货物台账：复制所有已登记货项
+        for it in cargo_old:
+            row = CargoRow()
+            row.name_edit.setText(it.get("item_name", ""))
+            row.qty_spin.setValue(it.get("qty", 1))
+            unit = it.get("unit", "")
+            if unit:
+                idx_u = row.unit_combo.findText(unit)
+                if idx_u >= 0:
+                    row.unit_combo.setCurrentIndex(idx_u)
+            for i, dim in enumerate(["dim_l", "dim_w", "dim_h"]):
+                val = it.get(dim)
+                if val:
+                    row.dim_spins[i].setValue(val)
+            w = it.get("weight_kg")
+            if w:
+                row.weight_spin.setValue(w)
+            pack = it.get("packaging", "")
+            if pack:
+                idx_p = row.pack_combo.findText(pack)
+                if idx_p >= 0:
+                    row.pack_combo.setCurrentIndex(idx_p)
+            row.marks_edit.setText(it.get("marks", ""))
+            self._add_cargo_row_existing(row)
+
+        self._update_cargo_summary()
+        self._update_preview()
+        self._refresh_tz_hint()
+        self.toast.emit(f"已加载模板：{proj['project_name']}")
+
+    def _build_node_rows(self, duration_map=None):
+        """重建节点行，duration_map 可覆盖默认耗时（复制模板时用）"""
+        duration_map = duration_map or {}
         for w in list(self._node_widgets.values()):
             w[0].deleteLater()
         self._node_widgets.clear()
@@ -405,7 +595,7 @@ class NewProjectPage(QWidget):
             rlayout.setContentsMargins(8, 6, 8, 6)
             rlayout.setSpacing(12)
 
-            seq_label = QLabel(f"{node['id']}")
+            seq_label = QLabel(f"{node['node_id']}")
             seq_label.setFixedSize(30, 30)
             seq_label.setAlignment(Qt.AlignCenter)
             seq_label.setStyleSheet(
@@ -414,12 +604,12 @@ class NewProjectPage(QWidget):
             )
             rlayout.addWidget(seq_label)
 
-            name_label = QLabel(node["name"])
+            name_label = QLabel(node["node_name"])
             name_label.setFixedWidth(190)
             name_label.setStyleSheet(f"font-size: 13px; color: {TEXT_PRIMARY};")
             rlayout.addWidget(name_label)
 
-            role_label = QLabel(node["role"])
+            role_label = QLabel(node["role_label"])
             role_label.setStyleSheet(f"font-size: 11px; color: {TEXT_SECONDARY};")
             rlayout.addWidget(role_label)
 
@@ -427,7 +617,8 @@ class NewProjectPage(QWidget):
 
             dur_spin = QSpinBox()
             dur_spin.setRange(1, 999)
-            dur_spin.setValue(node["duration"])
+            default_dur = duration_map.get(node["node_key"], node["duration"])
+            dur_spin.setValue(default_dur)
             dur_spin.setFixedWidth(76)
             dur_spin.valueChanged.connect(self._update_preview)
             rlayout.addWidget(dur_spin)
@@ -436,8 +627,15 @@ class NewProjectPage(QWidget):
             unit.setStyleSheet(f"font-size: 13px; color: {TEXT_SECONDARY};")
             rlayout.addWidget(unit)
 
+            date_label = QLabel("")
+            date_label.setFixedWidth(150)
+            date_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            date_label.setStyleSheet(
+                f"font-size: 11px; color: {TEXT_TERTIARY}; font-variant-numeric: tabular-nums;")
+            rlayout.addWidget(date_label)
+
             self.schedule_layout.addWidget(row)
-            self._node_widgets[node["id"]] = (row, dur_spin)
+            self._node_widgets[node["node_id"]] = (row, dur_spin, date_label)
 
     # ── 货物台账行管理 ──
 
@@ -449,6 +647,14 @@ class NewProjectPage(QWidget):
         self._cargo_rows.append(row)
         self._renumber_cargo()
         self._update_cargo_summary()
+
+    def _add_cargo_row_existing(self, row):
+        """供模板加载使用，已构造好的行直接插进去"""
+        row.on_delete(self._remove_cargo_row)
+        row.changed.connect(self._update_cargo_summary)
+        self.cargo_body_lay.insertWidget(self.cargo_body_lay.count() - 1, row)
+        self._cargo_rows.append(row)
+        self._renumber_cargo()
 
     def _remove_cargo_row(self, row):
         if row in self._cargo_rows:
@@ -505,11 +711,13 @@ class NewProjectPage(QWidget):
     def _on_country_changed(self):
         self._build_node_rows()
         self._update_preview()
+        self._refresh_tz_hint()
 
     # ── 出口港：分组下拉 / 查询对话框 / 备注预览 ──
 
     def _rebuild_port_combo(self):
         """重建出口港下拉：『通用方案』置顶 + 港口群分组（组头不可选）。"""
+        from PySide6.QtGui import QStandardItemModel, QStandardItem
         model = QStandardItemModel(self)
         def_group = QStandardItem("不指定特定港口平台（通用方案）")
         def_group.setData(None, Qt.UserRole)
@@ -545,6 +753,7 @@ class NewProjectPage(QWidget):
         # 选中具体港 → 显示"查看注入备注"按钮
         self.port_remark_btn.setVisible(bool(key))
         self._update_preview()
+        self._refresh_tz_hint()
 
     def _open_port_picker(self):
         """打开港口查询对话框（分组浏览 + 搜索 + 选中回填）。"""
@@ -573,8 +782,8 @@ class NewProjectPage(QWidget):
         for node in tmpl["nodes"]:
             if node["area"] != "DOME":  # 仅国内段 1-4 注入平台备注
                 continue
-            final = merge_node_notes(node.get("remark", ""), key, node["id"])
-            lines.append((node["id"], node["name"], final))
+            final = merge_node_notes(node.get("remark", ""), key, node["node_id"])
+            lines.append((node["node_id"], node["node_name"], final))
 
         has_platform = any(platform_note(key, nid) for nid, _, _ in lines)
 
@@ -666,33 +875,64 @@ class NewProjectPage(QWidget):
         lay.addLayout(btn_row)
         dlg.exec()
 
+    def _refresh_tz_hint(self):
+        """§6.6/D21：ETD/ETA 旁展示「当地时间 → 北京时间」换算辅助与偏差告警。"""
+        if getattr(self, "tz_hint", None) is None:
+            return
+        try:
+            from services import timezone_helper as tzh
+            port_key = self.port_combo.currentData() if getattr(self, "port_combo", None) else None
+            country = self.country_combo.currentData() if getattr(self, "country_combo", None) else None
+            etd = self.batch_etd_edit.date().toString("yyyy-MM-dd")
+            eta = self.batch_eta_edit.date().toString("yyyy-MM-dd")
+            lines = [tzh.hint_for_port(port_key, country)]
+            if country:
+                co = tzh.country_timezone_offset(country)
+                lines.append(tzh.convert_line(eta, co, "local2bj", country_code=country)
+                             + "（到港当地表）")
+            warn = tzh.plausibility_warning(etd, eta)
+            if warn:
+                lines.append("⚠ " + "；".join(warn))
+            self.tz_hint.setText("　".join(x for x in lines if x))
+        except Exception as e:
+            self.tz_hint.setText(f"（时区提示不可用：{e}）")
+
     def _update_preview(self):
         try:
-            etd = self.etd_edit.date().toPython()
-            eta = self.eta_edit.date().toPython()
+            etd = self.batch_etd_edit.date().toPython()
+            eta = self.batch_eta_edit.date().toPython()
             if eta <= etd:
                 self._set_preview("ETA 必须晚于 ETD 至少 1 天", RED, "#FDEBEA")
                 return
 
             country_code = self.country_combo.currentData()
             tmpl = get_country(country_code)
-            nodes_cfg = []
-            for node in tmpl["nodes"]:
-                dur = self._node_widgets[node["id"]][1].value()
-                nodes_cfg.append({"id": node["id"], "dur": dur, "area": node["area"]})
+            nodes = list(full_template())
+            for node in nodes:
+                if node["node_id"] in self._node_widgets:
+                    dur = self._node_widgets[node["node_id"]][1].value()
+                    node["duration"] = dur
 
-            plan = generate_schedule(etd.strftime("%Y-%m-%d"), eta.strftime("%Y-%m-%d"), nodes_cfg)
-            first_date = plan[1][0]
-            last_date = plan[max(plan.keys())][1]
-            sea_node = next(n for n in tmpl["nodes"] if n["area"] == "SEA")
-            sea_days = (_parse_date(plan[sea_node["id"]][1]) - _parse_date(plan[sea_node["id"]][0])).days
+            plan = compute_plan(etd.strftime("%Y-%m-%d"), eta.strftime("%Y-%m-%d"), nodes)
 
-            port_code = self.port_combo.currentData()
+            # 各节点行展示各自的建议起止日期，便于与节点配合核对
+            for n in nodes:
+                w = self._node_widgets.get(n["node_id"])
+                if w and len(w) >= 3 and n["node_key"] in plan:
+                    s, e = plan[n["node_key"]]
+                    w[2].setText(f"{s[5:]} → {e[5:]}" if s.startswith("20") else f"{s} → {e}")
+
+            first_date = plan[nodes[0]["node_key"]][0]
+            last_date = plan[nodes[-1]["node_key"]][1]
+            sea_node = next(n for n in nodes if n["area"] == "SEA")
+            sea_days = (_parse_date(plan[sea_node["node_key"]][1]) - _parse_date(plan[sea_node["node_key"]][0])).days
+
+            port_code = self._selected_port_key()
             port = get_port(port_code)
             port_text = f" · 出口港 {port['name']}" if port else " · 通用方案"
 
             self._set_preview(
-                f"将生成 {len(nodes_cfg)} 个节点 · {first_date} → {last_date} · 海运 {sea_days} 天{port_text}",
+                f"将生成 {len(nodes)} 个节点 · {first_date} → {last_date} · 海运 {sea_days} 天{port_text}",
                 GREEN, "#E8F8EC"
             )
         except Exception as e:
@@ -713,59 +953,99 @@ class NewProjectPage(QWidget):
             return
         self.name_edit.setStyleSheet("")
 
-        etd = self.etd_edit.date().toPython()
-        eta = self.eta_edit.date().toPython()
+        etd = self.batch_etd_edit.date().toPython()
+        eta = self.batch_eta_edit.date().toPython()
         if eta <= etd:
             self.toast.emit("ETA 必须晚于 ETD 至少 1 天")
             return
 
         country_code = self.country_combo.currentData()
-        port_code = self.port_combo.currentData()
+        port_code = self._selected_port_key()
         buffer_days = self.buffer_spin.value()
         tmpl = get_country(country_code)
 
-        nodes_cfg = []
-        for node in tmpl["nodes"]:
-            dur = self._node_widgets[node["id"]][1].value()
-            nodes_cfg.append({"id": node["id"], "dur": dur, "area": node["area"]})
-
-        plan = generate_schedule(etd.strftime("%Y-%m-%d"), eta.strftime("%Y-%m-%d"), nodes_cfg)
-
+        # 1. 创建项目
         project_id = f"proj-{uuid4().hex[:8]}"
         project = {
             "project_id": project_id,
             "project_name": name,
             "country": country_code,
             "export_port": port_code,
-            "etd": etd.strftime("%Y-%m-%d"),
-            "eta": eta.strftime("%Y-%m-%d"),
+            "etd": None,  # 项目级不再必填，由批次路由保存
+            "eta": None,
             "buffer_days": buffer_days,
         }
         db.insert_project(project)
         _oplog("project_create", project_id, subject=f"项目「{name}」", detail="新建项目")
 
-        nodes = []
-        for node in tmpl["nodes"]:
-            s, e = plan[node["id"]]
-            remark = merge_node_notes(node.get("remark", ""), port_code, node["id"])
-            nodes.append({
-                "node_id": node["id"],
-                "node_name": node["name"],
-                "role_label": node["role"],
-                "seq": node["id"],
+        # 2. 创建批次（1A 要求）
+        pno = db.ensure_project_no(project_id, None)
+        batch_no_input = self.batch_no_edit.text().strip()
+        if not batch_no_input:
+            batch_no = f"{pno}-B01"
+        else:
+            batch_no = batch_no_input
+        batch = db.create_default_batch(project_id, batch_no)
+        batch_id = batch["batch_id"]
+
+        # 更新批次额外字段
+        db.update_batch(batch_id,
+                       batch_name=self.batch_name_edit.text().strip() or None,
+                       booking_no=self.booking_no_edit.text().strip() or None,
+                       mbl_no=self.mbl_no_edit.text().strip() or None)
+
+        # 3. 保存线路路由（§9：一期恒 SEA / mode_chain=["SEA"]）
+        mode_primary = self.mode_combo.currentData() or mode_names.DEFAULT_PRIMARY
+        if not mode_names.is_enabled(mode_primary):
+            # 理论上不可达（下拉已置灰），双保险
+            self.toast.emit(f"运输方式「{mode_names.label(mode_primary)}」为后续阶段能力，本期不可选")
+            return
+        mode_chain = mode_names.DEFAULT_CHAIN
+
+        route = {
+            "mode_primary": mode_primary,
+            "mode_chain": mode_chain,
+            "country": country_code,
+            "export_port": port_code,
+            "etd": etd.strftime("%Y-%m-%d"),
+            "eta": eta.strftime("%Y-%m-%d"),
+        }
+        db.upsert_route(batch_id, **route)
+
+        # 4. 节点（用当前耗时 + 批次 ETD/ETA 计算排期）
+        nodes = list(full_template())
+        for node in nodes:
+            if node["node_id"] in self._node_widgets:
+                dur = self._node_widgets[node["node_id"]][1].value()
+                node["duration"] = dur
+
+        plan = compute_plan(etd.strftime("%Y-%m-%d"), eta.strftime("%Y-%m-%d"), nodes)
+        db_nodes = []
+        for node in nodes:
+            s, e = plan[node["node_key"]]
+            remark = merge_node_notes(node.get("remark", ""), port_code, node["node_id"])
+            db_nodes.append({
+                "node_id": node["node_id"],
+                "node_key": node["node_key"],
+                "node_name": node["node_name"],
+                "role_label": node["role_label"],
+                "seq": node["seq"],
                 "area": node["area"],
-                "default_duration": node["duration"],
-                "duration": self._node_widgets[node["id"]][1].value(),
+                "default_duration": node["default_duration"],
+                "duration": node["duration"],
+                "calendar_mode": node["calendar_mode"],
+                "key_node": node["key_node"],
                 "plan_start": s,
                 "plan_end": e,
                 "remark": remark,
             })
-        db.insert_nodes(project_id, nodes)
+        db.insert_nodes(project_id, db_nodes, batch_id=batch_id)
 
+        # 5. 单证清单
         files = bootstrap(country_code, port_code, plan)
-        db.insert_files(project_id, files)
+        db.insert_files(project_id, files, batch_id=batch_id)
 
-        # 货物台账
+        # 6. 货物台账
         cargo_count = 0
         over_count = 0
         raw_items = [r.to_item() for r in self._cargo_rows]
@@ -778,11 +1058,11 @@ class NewProjectPage(QWidget):
                 continue
             valid.append(normalize_item(it))
         if valid:
-            db.insert_cargo_items(project_id, valid)
+            db.insert_cargo_items(project_id, valid, batch_id=batch_id)
             cargo_count = len(valid)
             over_count = summary(valid)["over"]
 
-        # 班轮信息
+        # 7. 班轮信息
         has_vessel = any([self.vessel_name.text().strip(), self.voyage.text().strip(),
                           self.imo.text().strip(), self.carrier.text().strip(),
                           self.mmsi.text().strip()])
@@ -792,19 +1072,32 @@ class NewProjectPage(QWidget):
                              voyage=self.voyage.text().strip() or None,
                              imo=self.imo.text().strip() or None,
                              carrier=self.carrier.text().strip() or None,
-                             mmsi=self.mmsi.text().strip() or None)
+                             mmsi=self.mmsi.text().strip() or None,
+                             batch_id=batch_id)
+
+        # 8. §6.8/§12.7 数据校验：阻断级问题立即回滚并给出明确错误
+        from services import validation as vd
+        try:
+            vd.validate_batch_or_raise(batch_id)
+        except vd.ValidationError as e:
+            db.delete_project_cascade(project_id)
+            self.toast.emit("保存被拒绝：" + "；".join(e.problems[:3]))
+            return
+        warn = vd.advisory_problems(batch_id)
 
         port_text = ""
         if port_code:
             port_text = f"，国内段已套用{get_port(port_code)['name']}线上平台备注"
-
         cargo_text = f"，货物 {cargo_count} 项" + ("，含超限件" if over_count else "")
-        self.toast.emit(f'项目「{name}」已创建，生成 {len(nodes)} 节点与 {len(files)} 份单证清单'
-                        f'{cargo_text}{port_text}')
+        mode_text = f"，线路模式 {mode_names.label(mode_primary)}"
+        warn_text = f"；提示 {len(warn)} 项（详见批次管理）" if warn else ""
+        self.toast.emit(f'项目「{name}」已创建，生成 {len(db_nodes)} 节点与 {len(files)} 份单证清单'
+                        f'{mode_text}{cargo_text}{port_text}{warn_text}')
         self.navigate.emit("dashboard")
 
     def refresh(self):
-        pass
+        # 每次进入页面重建复制模板下拉，使新建/已完成项目出现在可选列表
+        self._rebuild_copy_list()
 
 
 def _parse_date(s):
@@ -816,8 +1109,6 @@ class PortPickerDialog(QDialog):
     """港口查询对话框：左侧分组/搜索列表，右侧能力详情，底部选用/取消。
 
     Apple 极简：浅灰底 + 白卡片 + 几何矢量图标，无 emoji。
-    左 QTreeWidget 展示 港口群→港（搜索框过滤），右区用能力卡片展示
-    浮吊/吃水/库场 + 次要资料，选中后地图同步定位。
     """
 
     def __init__(self, parent=None):
@@ -828,6 +1119,7 @@ class PortPickerDialog(QDialog):
         self._build()
 
     def _build(self):
+        from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
         self.setStyleSheet(f"QDialog {{ background: {BG}; }}")
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 16)
@@ -986,6 +1278,7 @@ class PortPickerDialog(QDialog):
         self._show_detail(key)
         # 定位并选中左侧树节点
         self._select_in_tree(key)
+        self._update_hint()
 
     def map_count(self):
         """当前地图上的港口数量（用于"未找到匹配"提示）。"""
