@@ -118,6 +118,15 @@ class MainWindow(QMainWindow):
         tb_layout.addWidget(self.page_title)
         tb_layout.addStretch()
 
+        # ── 线路管理（P0-1/2：线路模板 + 批次线路） ──
+        self.route_btn = QPushButton("线路管理")
+        self.route_btn.setObjectName("secondary")
+        self.route_btn.setCursor(Qt.PointingHandCursor)
+        self.route_btn.setFixedHeight(28)
+        self.route_btn.setToolTip("线路模板管理 · 批次线路选择")
+        self.route_btn.clicked.connect(self._open_route_manager)
+        tb_layout.addWidget(self.route_btn)
+
         # ── 时钟设置（测试用，交付前删除） ──
         self.clock_btn = QPushButton()
         self.clock_btn.setObjectName("clockBtn")
@@ -335,6 +344,10 @@ class MainWindow(QMainWindow):
         """切换时间后刷新全部依赖'今日'的界面与预警"""
         self._update_clock_btn()
         self._navigate(self._current_page)
+
+    def _open_route_manager(self):
+        from ui.route_manager import RouteManagerDialog
+        RouteManagerDialog(self).exec()
 
     def _show_today_todo(self):
         """今日待办弹窗：按启用中批次聚合（§10.5 同一口径）。"""

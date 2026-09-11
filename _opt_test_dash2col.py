@@ -151,16 +151,21 @@ check(wb._conflict_count.text() == f"{len(wb._conflicts)} 条", "冲突条计数
 check(bool(m.canvas().conflict_batch_ids()),
       f"冲突行可在图上定位（{len(m.canvas().conflict_batch_ids())} 个批次）")
 
-print("== 4b) 总览交互：悬停明细 / 点击行跳单批次 ==")
-wb._on_overview_hover(wb._overview.canvas().row_payload(0))
-txt = wb._hover_info.text()
-check(rows[0]["batch_no"] in txt and ("DOME" in txt or "SEA" in txt),
-      f"悬停显示批次提交状态与三段区间：{txt[:60]}")
+print("== 4b) 总览为纯展示：只读、不响应悬停/单击/双击 ==")
+canvas = m.canvas()
+check(canvas._interactive is False, "画布只读：interactive=False（不产生悬停/跳转）")
 target = rows[-1]["batch_id"]
-wb._on_overview_row({"batch_id": target}); app.processEvents()
-check(wb.mode == "single", "点击总览某行 → 切回单批次视图")
-check(wb._batch_id == target, "当前批次已切到被点击的批次")
-check(wb._right_panel.isVisible(), "回到单批次后右栏恢复（可继续操作）")
+# 模拟双击 → 不切回单批次、模式保持 merged
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QEvent, QPointF, Qt as _Qt
+from ui.widgets.gantt_overview import NAME_W  # noqa: E402
+ev = QMouseEvent(QEvent.Type.MouseButtonDblClick, QPointF(NAME_W + 10, 60),
+                 QPointF(NAME_W + 10, 60), _Qt.MouseButton.LeftButton,
+                 _Qt.MouseButton.LeftButton, _Qt.KeyboardModifier.NoModifier)
+canvas.mouseDoubleClickEvent(ev); app.processEvents()
+check(wb.mode == "merged", "双击总览不再跳转（保持全批次视图）")
+canvas.mouseMoveEvent(ev); app.processEvents()
+check(wb._hover_info.text() == "", "悬停不再弹出内联明细（纯展示）")
 
 # ══════════ 5) 操作型工作台 ══════════
 print("== 5) 操作：勾单证 / 推迟提前 / 撤销（不重建甘特与面板）==")

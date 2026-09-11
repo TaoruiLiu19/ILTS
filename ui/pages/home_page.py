@@ -74,8 +74,12 @@ class BatchRow(QFrame):
             f" background: {GRAY_SOFT}; border-radius: 6px; padding: 2px 8px;")
         lay.addWidget(st)
 
-        span = QLabel(f'{m["etd"] or "未设船期"} → {m["eta"] or "—"}')
+        # 批次起止 = 整批次计划区间（提空箱→交付/还箱），与主看板口径一致
+        bstart = m["batch_start"] or "未排期"
+        bend = m["batch_end"] or "—"
+        span = QLabel(f'{bstart} → {bend}')
         span.setStyleSheet(f"font-size: 11px; color: {TEXT_SECONDARY};")
+        span.setToolTip(f'船期 ETD {m["etd"] or "—"} → ETA {m["eta"] or "—"}')
         lay.addWidget(span)
         lay.addStretch()
 

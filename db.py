@@ -374,6 +374,222 @@ CREATE TABLE IF NOT EXISTS insurance_policies (
     note        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_insurance_batch ON insurance_policies(batch_id);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 多式联运统一模型（数据模型升级：Project → Batch → Route → Leg → Node）
+-- 新增表全部独立存在，不与既有 V2 表冲突；既有 nodes/files 通过锚点列打通。
+-- 纯海运 =「1 条线路 + 1 个 sea leg + 原节点」。
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- 3.3 地点库（多式联运统一地点）
+CREATE TABLE IF NOT EXISTS locations (
+    loc_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    unlocode        TEXT UNIQUE,          -- 如 CNSHA, BRSSZ
+    name            TEXT NOT NULL,
+    loc_type        TEXT NOT NULL DEFAULT 'port'
+                    CHECK (loc_type IN ('port','airport','rail_station','terminal','warehouse','border')),
+    country         TEXT,
+    timezone        TEXT,
+    created_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_locations_type ON locations(loc_type);
+
+-- 3.4 线路模板（可复用运输产品）
+CREATE TABLE IF NOT EXISTS route_templates (
+    template_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_name   TEXT NOT NULL,
+    description     TEXT,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS route_template_legs (
+    template_leg_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id     INTEGER NOT NULL REFERENCES route_templates(template_id),
+    seq             INTEGER NOT NULL,
+    mode            TEXT NOT NULL CHECK (mode IN ('sea','road','rail','air')),
+    origin_name     TEXT,
+    dest_name       TEXT,
+    default_carrier_role TEXT,
+    UNIQUE (template_id, seq)
+);
+
+-- 3.5 运输线路实例（候选/选中/执行）
+CREATE TABLE IF NOT EXISTS routes (
+    route_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        TEXT NOT NULL REFERENCES batches(batch_id),
+    template_id     INTEGER REFERENCES route_templates(template_id),
+    route_name      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'candidate'
+                    CHECK (status IN ('candidate','selected','active','completed','cancelled')),
+    is_active       INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT,
+    updated_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_routes_batch ON routes(batch_id);
+-- 一个批次最多一条 active 线路（部分唯一索引）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_routes_active
+ON routes(batch_id) WHERE is_active = 1 AND status NOT IN ('cancelled','completed');
+
+-- 3.6 运输段（单一路径段）
+CREATE TABLE IF NOT EXISTS route_legs (
+    leg_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_id        INTEGER NOT NULL REFERENCES routes(route_id),
+    seq             INTEGER NOT NULL,
+    mode            TEXT NOT NULL CHECK (mode IN ('sea','road','rail','air')),
+    origin_name     TEXT,
+    dest_name       TEXT,
+    origin_loc_id   INTEGER REFERENCES locations(loc_id),
+    dest_loc_id     INTEGER REFERENCES locations(loc_id),
+    carrier_id      TEXT,
+    vehicle_no      TEXT,
+    voyage_flight_train TEXT,
+    planned_etd     TEXT,
+    planned_eta     TEXT,
+    actual_etd      TEXT,
+    actual_eta      TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','running','completed','cancelled')),
+    created_at      TEXT,
+    updated_at      TEXT,
+    UNIQUE (route_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_route_legs_route ON route_legs(route_id);
+
+-- 3.7 节点定义（按运输方式的标准节点模板）
+CREATE TABLE IF NOT EXISTS node_defs (
+    node_def_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    mode            TEXT NOT NULL CHECK (mode IN ('sea','road','rail','air','common')),
+    node_key        TEXT NOT NULL,
+    node_name       TEXT NOT NULL,
+    phase           TEXT,
+    work_item       TEXT,
+    default_anchor_level TEXT NOT NULL DEFAULT 'node'
+                        CHECK (default_anchor_level IN ('project','batch','route','leg','node')),
+    required_docs   TEXT,
+    UNIQUE (mode, node_key)
+);
+CREATE INDEX IF NOT EXISTS idx_node_defs_mode ON node_defs(mode);
+
+-- 3.9 单证定义（统一主数据，缺省锚点级别）
+CREATE TABLE IF NOT EXISTS doc_definitions (
+    doc_def_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_code        TEXT NOT NULL UNIQUE,
+    doc_name        TEXT NOT NULL,
+    default_anchor_level TEXT NOT NULL DEFAULT 'batch'
+                        CHECK (default_anchor_level IN ('project','batch','route','leg','node')),
+    required        INTEGER NOT NULL DEFAULT 0,
+    phase           TEXT,
+    work_item       TEXT,
+    due_node_key    TEXT,
+    due_type        TEXT CHECK (due_type IN ('before_node','at_node','after_node')),
+    created_at      TEXT
+);
+
+-- 3.10 文件记录（多式联运统一锚点；独立承载 file_path/hash/version，避免与前端单证清单冲突）
+CREATE TABLE IF NOT EXISTS file_records (
+    file_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_def_id      INTEGER NOT NULL REFERENCES doc_definitions(doc_def_id),
+    anchor_level    TEXT NOT NULL CHECK (anchor_level IN ('project','batch','route','leg','node')),
+    project_id      TEXT NOT NULL REFERENCES projects(project_id),
+    batch_id        TEXT REFERENCES batches(batch_id),
+    route_id        INTEGER REFERENCES routes(route_id),
+    leg_id          INTEGER REFERENCES route_legs(leg_id),
+    node_id         INTEGER,             -- 节点实例主键 = (batch_id, node_id)，跨批次不唯一，故不建 FK
+    file_name       TEXT NOT NULL,
+    file_path       TEXT NOT NULL,
+    file_hash       TEXT,
+    version         INTEGER NOT NULL DEFAULT 1,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','submitted','approved','rejected','superseded','deleted')),
+    submitted_at    TEXT,
+    submitted_by    TEXT,
+    created_at      TEXT,
+    updated_at      TEXT,
+    CHECK (
+        (anchor_level = 'project' AND project_id IS NOT NULL)
+        OR (anchor_level = 'batch' AND project_id IS NOT NULL AND batch_id IS NOT NULL)
+        OR (anchor_level = 'route' AND project_id IS NOT NULL AND batch_id IS NOT NULL AND route_id IS NOT NULL)
+        OR (anchor_level = 'leg' AND project_id IS NOT NULL AND batch_id IS NOT NULL AND route_id IS NOT NULL AND leg_id IS NOT NULL)
+        OR (anchor_level = 'node' AND project_id IS NOT NULL AND batch_id IS NOT NULL AND node_id IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_file_records_anchor ON file_records(anchor_level, project_id);
+CREATE INDEX IF NOT EXISTS idx_file_records_batch ON file_records(batch_id);
+
+-- 3.11 提交日志
+CREATE TABLE IF NOT EXISTS submission_logs (
+    log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id         INTEGER NOT NULL REFERENCES file_records(file_id),
+    doc_def_id      INTEGER NOT NULL,
+    project_id      TEXT NOT NULL,
+    batch_id        TEXT,
+    route_id        INTEGER,
+    leg_id          INTEGER,
+    node_id         INTEGER,
+    anchor_level    TEXT NOT NULL,
+    action          TEXT NOT NULL
+                    CHECK (action IN ('submit','update','approve','reject','supersede')),
+    operator        TEXT,
+    remark          TEXT,
+    created_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_submission_logs_file ON submission_logs(file_id);
+
+-- 8.1 费用（可按段）
+CREATE TABLE IF NOT EXISTS charges (
+    charge_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      TEXT NOT NULL,
+    batch_id        TEXT,
+    route_id        INTEGER,
+    leg_id          INTEGER,
+    node_id         INTEGER,
+    direction       TEXT CHECK (direction IN ('receivable','payable')),
+    charge_type     TEXT,
+    amount          REAL,
+    currency        TEXT,
+    status          TEXT,
+    created_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_charges_project ON charges(project_id);
+
+-- 8.2 分包合同（可按段）
+CREATE TABLE IF NOT EXISTS subcontracts (
+    subcontract_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      TEXT NOT NULL,
+    batch_id        TEXT,
+    leg_id          INTEGER,
+    supplier_id     TEXT,
+    contract_no     TEXT,
+    amount          REAL,
+    currency        TEXT,
+    status          TEXT,
+    created_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_subcontracts_project ON subcontracts(project_id);
+
+-- 8.3 保险（可按段）
+CREATE TABLE IF NOT EXISTS insurances (
+    insurance_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      TEXT NOT NULL,
+    batch_id        TEXT,
+    route_id        INTEGER,
+    leg_id          INTEGER,
+    policy_no       TEXT,
+    insurer         TEXT,
+    amount          REAL,
+    currency        TEXT,
+    status          TEXT,
+    created_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_insurances_project ON insurances(project_id);
+
+-- 5.2 兼容视图：旧接口继续按 batch_id 查节点 / 文件
+CREATE VIEW IF NOT EXISTS v_nodes_legacy AS
+SELECT node_id, batch_id, node_key, node_name, planned_date, actual_date, status FROM nodes;
+CREATE VIEW IF NOT EXISTS v_files_legacy AS
+SELECT file_id, doc_def_id, project_id, batch_id, file_name, file_path, file_hash,
+       version, status, submitted_at, submitted_by
+FROM file_records WHERE anchor_level IN ('project','batch');
 """
 
 
@@ -387,6 +603,7 @@ def init_db():
     else:
         _rebuild_clean(conn)
     _ensure_columns(conn)
+    _ensure_anchor_indexes(conn)
     # 项目级单证一次性迁移（老库里的 9 行重复项 → project_files 3 行）；幂等，见函数内守卫
     _migrate_project_files(conn)
     conn.commit()
@@ -411,6 +628,11 @@ _ADDED_COLUMNS = {
     ],
     "nodes": [
         ("last_recompute_at", "TEXT"),
+        ("route_id", "INTEGER"),     # 多式联运统一模型锚点：所属线路 instance
+        ("leg_id", "INTEGER"),       # 所属运输段（纯海运 → 默认 sea leg）
+        ("node_def_id", "INTEGER"),  # 关联 node_defs 模板
+        ("planned_date", "TEXT"),    # 统一模型的计划节点日期（与 plan_start 同源）
+        ("actual_date", "TEXT"),     # 统一模型的实际节点日期
     ],
 }
 
@@ -435,6 +657,19 @@ def _ensure_columns(conn):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
 
+def _ensure_anchor_indexes(conn):
+    """§6 多式联运统一模型的锚点唯一索引（锚点列加好后建，幂等）。
+
+    段级节点唯一：同一运输段内 node_key 稳定标识不可重复；
+    线路级节点唯一：同一线路内 node_key 不可重复。
+    未锚点（route_id/leg_id 为 NULL）的旧节点行不受部分唯一索引约束。
+    """
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_route_key "
+                 "ON nodes(route_id, node_key) WHERE route_id IS NOT NULL")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_leg_key "
+                 "ON nodes(leg_id, node_key) WHERE leg_id IS NOT NULL")
+
+
 def _rebuild_clean(conn):
     """旧库（无 batches 表）→ 彻底清空业务表重建，避免残余旧主键/列冲突。"""
     owned = ["batch_schedule_changes", "batch_route_changes", "batch_parties",
@@ -442,7 +677,11 @@ def _rebuild_clean(conn):
              "doc_types", "insurance_policies",
              "container_batch_link", "containers", "vessel_positions", "vessel",
              "cargo_items", "files", "project_files", "nodes", "shift_history", "op_log", "batches",
-             "batch_routes", "projects", "settings", "migration_status"]
+             "batch_routes", "projects", "settings", "migration_status",
+             # 多式联运统一模型
+             "submission_logs", "file_records", "doc_definitions", "node_defs",
+             "route_legs", "routes", "route_template_legs", "route_templates",
+             "locations", "charges", "subcontracts", "insurances"]
     for t in owned:
         try:
             conn.execute(f"DROP TABLE IF EXISTS {t}")
@@ -1084,6 +1323,13 @@ def get_project(project_id):
 def get_projects_by_status(status):
     conn = get_conn()
     rows = conn.execute("SELECT * FROM projects WHERE status=? ORDER BY create_date", (status,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_projects():
+    """列出全部项目（不区分状态），供线路管理等跨项目入口选择。"""
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM projects ORDER BY create_date, project_id").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1809,3 +2055,558 @@ def set_setting(key, value):
     conn = get_conn()
     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
     conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 多式联运统一模型访问层（数据模型升级：Route → Leg → Node + 统一地点/模板）
+# 新增能力全部独立命名，不干扰既有 V2 接口；纯海运批次的默认线路/段由迁移工具回填。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_MM_NOW = _now
+
+
+# ── 3.3 地点库 ──
+
+def upsert_location(name, unlocode=None, loc_type="port", country=None,
+                    timezone=None, return_existing=False):
+    """按 unlocode/name 幂等写入地点；存在则不重复。返回 loc_id。"""
+    conn = get_conn()
+    row = None
+    if unlocode:
+        row = conn.execute("SELECT loc_id FROM locations WHERE unlocode=?", (unlocode,)).fetchone()
+    if row is None:
+        row = conn.execute("SELECT loc_id FROM locations WHERE name=?", (name,)).fetchone()
+    if row:
+        return row["loc_id"]
+    cur = conn.execute(
+        "INSERT INTO locations (unlocode, name, loc_type, country, timezone, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (unlocode, name, loc_type, country, timezone, _now()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_location(loc_id):
+    row = get_conn().execute("SELECT * FROM locations WHERE loc_id=?", (loc_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_locations(loc_type=None):
+    if loc_type:
+        rows = get_conn().execute(
+            "SELECT * FROM locations WHERE loc_type=? ORDER BY name", (loc_type,)).fetchall()
+    else:
+        rows = get_conn().execute("SELECT * FROM locations ORDER BY loc_type, name").fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── 3.4 线路模板 ──
+
+def create_route_template(template_name, description=None, legs=None):
+    """创建线路模板及其模板段。legs: [{seq, mode, origin_name, dest_name,
+    default_carrier_role}] → 返回 template_id。"""
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO route_templates (template_name, description, status, created_at) "
+        "VALUES (?,?,'active',?)", (template_name, description, _now()))
+    tid = cur.lastrowid
+    for leg in legs or []:
+        conn.execute(
+            "INSERT INTO route_template_legs (template_id, seq, mode, origin_name, dest_name, "
+            "default_carrier_role) VALUES (?,?,?,?,?,?)",
+            (tid, leg["seq"], leg["mode"], leg.get("origin_name"), leg.get("dest_name"),
+             leg.get("default_carrier_role")))
+    conn.commit()
+    return tid
+
+
+def get_route_template(template_id):
+    conn = get_conn()
+    t = conn.execute("SELECT * FROM route_templates WHERE template_id=?",
+                     (template_id,)).fetchone()
+    if not t:
+        return None
+    legs = conn.execute("SELECT * FROM route_template_legs WHERE template_id=? ORDER BY seq",
+                        (template_id,)).fetchall()
+    return {**dict(t), "legs": [dict(r) for r in legs]}
+
+
+def list_route_templates(status="active"):
+    rows = get_conn().execute(
+        "SELECT * FROM route_templates WHERE status=? ORDER BY template_id", (status,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── 3.5 运输线路实例 ──
+
+def create_route(batch_id, route_name, mode_chain=None, template_id=None,
+                 status="candidate", is_active=0):
+    """在批次下创建线路。mode_chain: 逗号分隔的段模式，如 'sea,road'，用于展开默认段。"""
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO routes (batch_id, template_id, route_name, status, is_active, created_at, "
+        "updated_at) VALUES (?,?,?,?,?,?,?)",
+        (batch_id, template_id, route_name, status, int(is_active), _now(), _now()))
+    rid = cur.lastrowid
+    if mode_chain:
+        seq = 0
+        for m in [x.strip() for x in mode_chain.split(",") if x.strip()]:
+            seq += 1
+            conn.execute(
+                "INSERT INTO route_legs (route_id, seq, mode, status, created_at, updated_at) "
+                "VALUES (?,?,?,'pending',?,?)", (rid, seq, m, _now(), _now()))
+    conn.commit()
+    return rid
+
+
+def get_routes(batch_id, include_cancelled=False):
+    sql = "SELECT * FROM routes WHERE batch_id=?"
+    if not include_cancelled:
+        sql += " AND status != 'cancelled'"
+    rows = get_conn().execute(sql + " ORDER BY is_active DESC, route_id", (batch_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_active_route(batch_id):
+    row = get_conn().execute(
+        "SELECT * FROM routes WHERE batch_id=? AND is_active=1 AND status NOT IN "
+        "('cancelled','completed') ORDER BY route_id LIMIT 1", (batch_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_route_from_template(batch_id, template_id, route_name=None):
+    """按线路模板在批次下新建一条候选线路，并复制模板各段。返回 route_id。"""
+    tpl = get_route_template(template_id)
+    if not tpl:
+        raise ValueError("线路模板不存在")
+    name = route_name or tpl["template_name"] or f"{batch_id} 线路"
+    rid = create_route(batch_id, name, template_id=template_id, status="candidate", is_active=0)
+    for leg in tpl["legs"]:
+        add_leg(rid, leg["mode"], seq=leg["seq"], origin_name=leg.get("origin_name"),
+                dest_name=leg.get("dest_name"))
+    return rid
+
+
+def set_active_route(batch_id, route_id):
+    """设为执行线路：同批次其它线路解除 active，本线路置 active/active 状态。
+
+    部分唯一索引 idx_routes_active 保证同一批次同时最多一条 active，
+    故必须先整体清零再置一（每条 UPDATE 语句后全程至多一行 is_active=1）。
+    """
+    conn = get_conn()
+    conn.execute("UPDATE routes SET is_active=0 WHERE batch_id=?", (batch_id,))
+    conn.execute(
+        "UPDATE routes SET is_active=1, status='active', updated_at=? WHERE route_id=?",
+        (_now(), route_id))
+    conn.commit()
+
+
+def update_route_status(route_id, status, is_active=None):
+    conn = get_conn()
+    kw = {"status": status, "updated_at": _now()}
+    if is_active is not None:
+        kw["is_active"] = int(is_active)
+    sets = ", ".join(f"{k}=?" for k in kw)
+    conn.execute(f"UPDATE routes SET {sets} WHERE route_id=?", (*kw.values(), route_id))
+    conn.commit()
+
+
+# ── 3.6 运输段 ──
+
+def add_leg(route_id, mode, seq=None, origin_name=None, dest_name=None, planned_etd=None,
+            planned_eta=None, carrier_id=None, voyage_flight_train=None):
+    conn = get_conn()
+    if seq is None:
+        r = conn.execute("SELECT COALESCE(MAX(seq),0)+1 AS s FROM route_legs WHERE route_id=?",
+                         (route_id,)).fetchone()
+        seq = r["s"]
+    cur = conn.execute(
+        "INSERT INTO route_legs (route_id, seq, mode, origin_name, dest_name, planned_etd, "
+        "planned_eta, carrier_id, voyage_flight_train, status, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)",
+        (route_id, seq, mode, origin_name, dest_name, planned_etd, planned_eta, carrier_id,
+         voyage_flight_train, _now(), _now()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_leg(leg_id):
+    row = get_conn().execute("SELECT * FROM route_legs WHERE leg_id=?", (leg_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_legs(route_id):
+    rows = get_conn().execute(
+        "SELECT * FROM route_legs WHERE route_id=? ORDER BY seq", (route_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_leg(leg_id, **kw):
+    conn = get_conn()
+    if kw:
+        kw["updated_at"] = _now()
+        sets = ", ".join(f"{k}=?" for k in kw)
+        conn.execute(f"UPDATE route_legs SET {sets} WHERE leg_id=?", (*kw.values(), leg_id))
+        conn.commit()
+
+
+# ── 3.7 节点定义模板 ──
+
+def upsert_node_def(mode, node_key, node_name, phase=None, work_item=None,
+                    default_anchor_level="node", required_docs=None):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO node_defs (mode, node_key, node_name, phase, work_item, "
+        "default_anchor_level, required_docs) VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(mode, node_key) DO UPDATE SET node_name=excluded.node_name, "
+        "phase=excluded.phase, work_item=excluded.work_item, "
+        "default_anchor_level=excluded.default_anchor_level, required_docs=excluded.required_docs",
+        (mode, node_key, node_name, phase, work_item, default_anchor_level, required_docs))
+    conn.commit()
+    row = conn.execute("SELECT node_def_id FROM node_defs WHERE mode=? AND node_key=?",
+                       (mode, node_key)).fetchone()
+    return row["node_def_id"]
+
+
+def list_node_defs(mode=None):
+    if mode:
+        rows = get_conn().execute(
+            "SELECT * FROM node_defs WHERE mode=? ORDER BY node_def_id", (mode,)).fetchall()
+    else:
+        rows = get_conn().execute("SELECT * FROM node_defs ORDER BY mode, node_def_id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_node_def(node_def_id):
+    row = get_conn().execute("SELECT * FROM node_defs WHERE node_def_id=?",
+                             (node_def_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ── 3.9 单证定义 ──
+
+def upsert_doc_definition(doc_code, doc_name, default_anchor_level="batch", required=0,
+                          phase=None, work_item=None, due_node_key=None, due_type=None):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO doc_definitions (doc_code, doc_name, default_anchor_level, required, phase, "
+        "work_item, due_node_key, due_type, created_at) VALUES (?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(doc_code) DO UPDATE SET doc_name=excluded.doc_name, "
+        "default_anchor_level=excluded.default_anchor_level, required=excluded.required, "
+        "phase=excluded.phase, work_item=excluded.work_item, "
+        "due_node_key=excluded.due_node_key, due_type=excluded.due_type",
+        (doc_code, doc_name, default_anchor_level, int(required), phase, work_item,
+         due_node_key, due_type, _now()))
+    conn.commit()
+    row = conn.execute("SELECT doc_def_id FROM doc_definitions WHERE doc_code=?",
+                       (doc_code,)).fetchone()
+    return row["doc_def_id"]
+
+
+def list_doc_definitions(anchor_level=None):
+    if anchor_level:
+        rows = get_conn().execute(
+            "SELECT * FROM doc_definitions WHERE default_anchor_level=? ORDER BY phase, doc_code",
+            (anchor_level,)).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT * FROM doc_definitions ORDER BY phase, default_anchor_level, doc_code").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_doc_definition(doc_code):
+    row = get_conn().execute("SELECT * FROM doc_definitions WHERE doc_code=?",
+                             (doc_code,)).fetchone()
+    return dict(row) if row else None
+
+
+# ── 3.10 文件记录（统一锚点） ──
+
+def insert_file_record(doc_def_id, anchor_level, project_id, file_name, file_path,
+                       batch_id=None, route_id=None, leg_id=None, node_id=None,
+                       file_hash=None, status="pending", submitted_by=None):
+    """写入一条统一文件记录（multi-modal 锚点）。校验锚点完整性与唯一性。"""
+    conn = get_conn()
+    _assert_anchor(anchor_level, project_id, batch_id, route_id, leg_id, node_id)
+    _assert_file_unique(conn, anchor_level, project_id, batch_id, route_id, leg_id, node_id,
+                        doc_def_id)
+    cur = conn.execute(
+        "INSERT INTO file_records (doc_def_id, anchor_level, project_id, batch_id, route_id, "
+        "leg_id, node_id, file_name, file_path, file_hash, version, status, submitted_at, "
+        "submitted_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)",
+        (doc_def_id, anchor_level, project_id, batch_id, route_id, leg_id, node_id,
+         file_name, file_path, file_hash, status,
+         _now() if status in ("submitted", "approved") else None, submitted_by, _now(), _now()))
+    fid = cur.lastrowid
+    conn.commit()
+    return fid
+
+
+def _assert_anchor(anchor_level, project_id, batch_id, route_id, leg_id, node_id):
+    required = {"project": dict(project_id=True),
+                "batch": dict(project_id=True, batch_id=True),
+                "route": dict(project_id=True, batch_id=True, route_id=True),
+                "leg": dict(project_id=True, batch_id=True, route_id=True, leg_id=True),
+                "node": dict(project_id=True, batch_id=True, node_id=True)}[anchor_level]
+    for k, need in required.items():
+        if need and not locals().get(k):
+            raise ValueError(f"锚点级别 {anchor_level} 缺少 {k}")
+
+
+def _assert_file_unique(conn, anchor_level, project_id, batch_id, route_id, leg_id, node_id,
+                        doc_def_id):
+    """同锚点同一文档只允许一份有效文件（pending/submitted/approved）。"""
+    cond, vals = {
+        "project": ("project_id=? AND anchor_level='project'", [project_id]),
+        "batch": ("project_id=? AND batch_id=? AND anchor_level='batch'", [project_id, batch_id]),
+        "route": ("project_id=? AND batch_id=? AND route_id=? AND anchor_level='route'",
+                  [project_id, batch_id, route_id]),
+        "leg": ("project_id=? AND batch_id=? AND route_id=? AND leg_id=? AND anchor_level='leg'",
+                [project_id, batch_id, route_id, leg_id]),
+        "node": ("project_id=? AND batch_id=? AND node_id=? AND anchor_level='node'",
+                 [project_id, batch_id, node_id]),
+    }[anchor_level]
+    row = conn.execute(
+        f"SELECT 1 FROM file_records WHERE doc_def_id=? AND {cond} "
+        "AND status NOT IN ('rejected','superseded','deleted') LIMIT 1",
+        (doc_def_id, *vals)).fetchone()
+    if row:
+        raise ValueError(f"该锚点下文档 {doc_def_id} 已存在有效文件，请先更新或作废")
+
+
+def get_file_records(anchor_level=None, project_id=None, batch_id=None, route_id=None,
+                     leg_id=None, node_id=None):
+    sql = "SELECT * FROM file_records WHERE 1=1"
+    args = []
+    if anchor_level:
+        sql += " AND anchor_level=?"
+        args.append(anchor_level)
+    if project_id:
+        sql += " AND project_id=?"
+        args.append(project_id)
+    if batch_id:
+        sql += " AND batch_id=?"
+        args.append(batch_id)
+    if route_id:
+        sql += " AND route_id=?"
+        args.append(route_id)
+    if leg_id:
+        sql += " AND leg_id=?"
+        args.append(leg_id)
+    if node_id:
+        sql += " AND node_id=?"
+        args.append(node_id)
+    rows = get_conn().execute(sql + " ORDER BY anchor_level, created_at", args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_file_record(file_id):
+    row = get_conn().execute("SELECT * FROM file_records WHERE file_id=?",
+                             (file_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_file_record(file_id, **kw):
+    conn = get_conn()
+    if kw.get("status") in ("submitted", "approved"):
+        kw.setdefault("submitted_at", _now())
+    if kw:
+        kw["updated_at"] = _now()
+        sets = ", ".join(f"{k}=?" for k in kw)
+        conn.execute(f"UPDATE file_records SET {sets} WHERE file_id=?", (*kw.values(), file_id))
+        conn.commit()
+
+
+# ── 3.11 提交日志 ──
+
+def log_submission(file_id, doc_def_id, project_id, anchor_level, action, operator=None,
+                   remark=None, batch_id=None, route_id=None, leg_id=None, node_id=None):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO submission_logs (file_id, doc_def_id, project_id, batch_id, route_id, "
+        "leg_id, node_id, anchor_level, action, operator, remark, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (file_id, doc_def_id, project_id, batch_id, route_id, leg_id, node_id, anchor_level,
+         action, operator, remark, _now()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_submission_logs(file_id=None, project_id=None, limit=200):
+    sql = "SELECT * FROM submission_logs WHERE 1=1"
+    args = []
+    if file_id:
+        sql += " AND file_id=?"
+        args.append(file_id)
+    if project_id:
+        sql += " AND project_id=?"
+        args.append(project_id)
+    rows = get_conn().execute(sql + " ORDER BY log_id DESC LIMIT ?", (*args, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── 8.1 费用 / 8.2 分包 / 8.3 保险（可按段） ──
+
+def insert_charge(project_id, direction, charge_type, amount, currency="USD",
+                  batch_id=None, route_id=None, leg_id=None, node_id=None, status="open"):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO charges (project_id, batch_id, route_id, leg_id, node_id, direction, "
+        "charge_type, amount, currency, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (project_id, batch_id, route_id, leg_id, node_id, direction, charge_type, amount,
+         currency, status, _now()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_charges(project_id, leg_id=None):
+    if leg_id:
+        rows = get_conn().execute(
+            "SELECT * FROM charges WHERE project_id=? AND leg_id=? ORDER BY charge_id",
+            (project_id, leg_id)).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT * FROM charges WHERE project_id=? ORDER BY charge_id", (project_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_subcontract(project_id, supplier_id, contract_no, amount, currency="USD",
+                       batch_id=None, leg_id=None, status="open"):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO subcontracts (project_id, batch_id, leg_id, supplier_id, contract_no, "
+        "amount, currency, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (project_id, batch_id, leg_id, supplier_id, contract_no, amount, currency, status, _now()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_subcontracts(project_id, leg_id=None):
+    if leg_id:
+        rows = get_conn().execute(
+            "SELECT * FROM subcontracts WHERE project_id=? AND leg_id=? ORDER BY subcontract_id",
+            (project_id, leg_id)).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT * FROM subcontracts WHERE project_id=? ORDER BY subcontract_id",
+            (project_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_insurance(project_id, policy_no, insurer, amount=None, currency="USD",
+                     batch_id=None, route_id=None, leg_id=None, status="active"):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO insurances (project_id, batch_id, route_id, leg_id, policy_no, insurer, "
+        "amount, currency, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (project_id, batch_id, route_id, leg_id, policy_no, insurer, amount, currency, status,
+         _now()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_insurances(project_id, leg_id=None):
+    if leg_id:
+        rows = get_conn().execute(
+            "SELECT * FROM insurances WHERE project_id=? AND leg_id=? ORDER BY insurance_id",
+            (project_id, leg_id)).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT * FROM insurances WHERE project_id=? ORDER BY insurance_id",
+            (project_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── §6 关键查询（多式联运组合查询） ──
+
+def get_batch_route_detail(batch_id):
+    """§6.1 查询批次完整线路：线路 + 排序段。无线路时返回 None。"""
+    conn = get_conn()
+    route = get_active_route(batch_id)
+    if not route:
+        return None
+    legs = get_legs(route["route_id"])
+    return {**route, "legs": legs}
+
+
+def get_batch_nodes_by_leg(batch_id):
+    """§6.2 查询批次全部节点（按段分组）：[{leg_seq, mode, nodes:[...]}]。"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT l.seq AS leg_seq, l.mode, l.leg_id, n.node_id, n.node_key, n.node_name, "
+        "n.plan_start, n.plan_end, n.status AS node_status "
+        "FROM routes r "
+        "JOIN route_legs l ON l.route_id = r.route_id "
+        "JOIN nodes n ON n.batch_id = r.batch_id "
+        "WHERE r.batch_id=? AND r.is_active=1 AND n.leg_id = l.leg_id "
+        "ORDER BY l.seq, n.seq", (batch_id,)).fetchall()
+    groups = {}
+    for r in rows:
+        g = groups.setdefault((r["leg_seq"], r["mode"], r["leg_id"]),
+                              {"leg_seq": r["leg_seq"], "mode": r["mode"],
+                               "leg_id": r["leg_id"], "nodes": []})
+        g["nodes"].append({"node_id": r["node_id"], "node_key": r["node_key"],
+                           "node_name": r["node_name"], "plan_start": r["plan_start"],
+                           "plan_end": r["plan_end"], "status": r["node_status"]})
+    return list(groups.values())
+
+
+def get_leg_required_files(leg_id):
+    """§6.3 查询某段需要提交的段级文件（缺省锚点=leg 的单证 + 已提交记录）。"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT d.doc_code, d.doc_name, d.required, "
+        "f.status AS file_status, f.file_id, f.version "
+        "FROM doc_definitions d "
+        "LEFT JOIN file_records f ON f.doc_def_id = d.doc_def_id "
+        "AND f.leg_id = ? AND f.anchor_level = 'leg' "
+        "AND f.status NOT IN ('rejected','superseded','deleted') "
+        "WHERE d.default_anchor_level = 'leg' "
+        "ORDER BY d.doc_code", (leg_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_project_level_missing(project_id):
+    """缺单证统计：项目级必填仅算一次（同项目一份）。"""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM doc_definitions d "
+        "LEFT JOIN file_records f ON f.doc_def_id = d.doc_def_id "
+        "AND f.project_id = ? AND f.anchor_level = 'project' "
+        "WHERE d.default_anchor_level = 'project' AND d.required = 1 "
+        "AND (f.file_id IS NULL OR f.status = 'pending')", (project_id,)).fetchone()
+    return row["c"]
+
+
+def count_anchor_missing(project_id, anchor_level, anchor_id):
+    """通用缺单证统计：batch/route/leg/node 各自按锚点 ID 统计必填未交数。"""
+    col = {"batch": "batch_id", "route": "route_id", "leg": "leg_id", "node": "node_id"}.get(
+        anchor_level)
+    if col is None:
+        raise ValueError(f"非法锚点级别: {anchor_level!r}")
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM doc_definitions d "
+        "LEFT JOIN file_records f ON f.doc_def_id = d.doc_def_id "
+        f"AND f.{col} = ? AND f.anchor_level = ? "
+        f"WHERE d.default_anchor_level = ? AND d.required = 1 "
+        "AND (f.file_id IS NULL OR f.status = 'pending')",
+        (anchor_id, anchor_level, anchor_level)).fetchone()
+    return row["c"]
+
+
+def aggregate_seg_status(batch_id):
+    """节点→段→线路状态聚合（§7）：段完成=该段全部节点 Done；线路完成=全部段完成。"""
+    route = get_active_route(batch_id)
+    if not route:
+        return {"route_status": "none", "legs": []}
+    legs = get_legs(route["route_id"])
+    out = []
+    for leg in legs:
+        nodes = get_conn().execute(
+            "SELECT status FROM nodes WHERE batch_id=? AND leg_id=?", (batch_id, leg["leg_id"])
+        ).fetchall()
+        done = all(n["status"] == "Done" for n in nodes)
+        out.append({**leg, "all_nodes_done": done})
+    all_done = bool(out) and all(o["all_nodes_done"] for o in out)
+    return {"route_status": "completed" if all_done else "pending", "legs": out}

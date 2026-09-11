@@ -619,6 +619,22 @@ def batch_metrics(batch_id, today=None):
     submitted = sum(1 for f in req if f.get("status") == "submitted")
     overdue = sum(1 for n in nodes if compute_node_status(n, today) == "Overdue")
     pending = len(req) - submitted
+
+    # 批次起止 = 该批次全部节点计划日期的整体区间（提空箱 → 交付/还箱）；
+    # 缺节点时回退到船期 ETD/ETA。若不含项目级、与顶部「缺单证」口径无关。
+    from datetime import date as _date
+    def _p(v):
+        if isinstance(v, _date):
+            return v
+        try:
+            y, m, d = str(v)[:10].split("-")
+            return _date(int(y), int(m), int(d))
+        except Exception:
+            return None
+    _starts = [_p(n.get("plan_start")) for n in nodes]
+    _starts = [x for x in _starts if x]
+    _ends = [_p(n.get("plan_end")) for n in nodes]
+    _ends = [x for x in _ends if x]
     return {
         "batch_id": batch_id,
         "batch_no": b.get("batch_no") or "",
@@ -629,6 +645,10 @@ def batch_metrics(batch_id, today=None):
         "port": route.get("export_port") or "",
         "etd": route.get("etd") or "",
         "eta": route.get("eta") or "",
+        "batch_start": (min(_starts).isoformat() if _starts
+                        else (route.get("etd") or "")),
+        "batch_end": (max(_ends).isoformat() if _ends
+                      else (route.get("eta") or "")),
         "node_done": n_done, "node_total": len(nodes),
         "doc_rate": (submitted / len(req) * 100) if req else 0.0,
         "doc_total": len(req), "doc_submitted": submitted,

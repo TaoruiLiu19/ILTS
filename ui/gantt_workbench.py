@@ -33,6 +33,7 @@ from services.file_checklist import merge_scope, pending_required
 from services.cargo_check import summary
 from services.scheduler import apply_shift, undo_last_shift, ShiftError
 from services.clock import get_today
+from services.node_template import EMPTY_PICKUP, LOADING, D_O_COLLECT, SITE_DELIVERY
 from ui.theme import (
     ACCENT, GREEN, RED, ORANGE, TEXT_PRIMARY,
     TEXT_SECONDARY, TEXT_TERTIARY, BORDER, HAIRLINE, ACCENT_SOFT, GRAY_SOFT,
@@ -67,6 +68,10 @@ def _parse(s):
         return date(int(y), int(m), int(d))
     except Exception:
         return None
+
+
+STATUS_CN_TXT = {"draft": "草稿", "ready": "已就绪", "running": "进行中",
+                 "completed": "待确认完成", "closed": "已完成", "cancelled": "已取消"}
 
 
 def _clear_layout(layout):
@@ -179,6 +184,8 @@ class GanttWorkbenchWindow(QMainWindow):
         self._today = get_today()
         self.mode = "single"
         self.zoom = "week"
+        self._axis_mode = "abs"
+        self._axis_anchor = "sail"
         self._conflicts = []                     # 当前模式下的资源冲突
         self._overview_data = []                 # 全批次总览的行数据（由 _overview_rows() 生成）
         self._chip = {}
@@ -321,16 +328,32 @@ class GanttWorkbenchWindow(QMainWindow):
             files = db.get_files_by_batch(bid)
             req = [f for f in files if f.get("doc_type") == "required"]
             spans = {}
+            by_key = {}
+            for n in nodes:
+                by_key[n.get("node_key")] = n
             for area in ("DOME", "SEA", "OVERSEA"):
                 seg = [n for n in nodes if n["area"] == area
                        and n.get("plan_start") and n.get("plan_end")]
                 if seg:
                     spans[area] = (min(_parse(n["plan_start"]) for n in seg),
                                    max(_parse(n["plan_end"]) for n in seg))
+            route = db.get_route(bid) or {}
+            etd = _parse(route.get("etd"))
+            eta = _parse(route.get("eta"))
             rows.append({
                 "batch_id": bid, "batch_no": b.get("batch_no") or "",
-                "status": b.get("status"), "etd": (db.get_route(bid) or {}).get("etd"),
+                "status": b.get("status"), "etd": route.get("etd"),
                 "spans": spans,
+                "milestones": {
+                    "pickup": (lambda n: _parse(n["plan_start"]) if n else None)(
+                        by_key.get(EMPTY_PICKUP)),
+                    "sail": etd or (lambda n: _parse(n["plan_start"]) if n else None)(
+                        by_key.get(LOADING)),
+                    "arrive": eta or (lambda n: _parse(n["plan_start"]) if n else None)(
+                        by_key.get(D_O_COLLECT)),
+                    "deliver": (lambda n: _parse(n["plan_end"]) if n else None)(
+                        by_key.get(SITE_DELIVERY)),
+                },
                 "docs": {"req_total": len(req),
                          "req_submitted": sum(1 for f in req
                                               if f.get("status") == "submitted"),
@@ -341,6 +364,46 @@ class GanttWorkbenchWindow(QMainWindow):
                 "conflict": bid in conflict_ids,
             })
         return rows
+
+    def _overview_links(self):
+        """跨批共柜衔接线：共享同一集装箱的批次，由先装船方连向后装船方。
+
+        数据源为 container_batch_link（共柜预留），无需额外录入依赖。
+        """
+        links = []
+        bid_list = [b["batch_id"] for b in self._batches]
+        if not bid_list:
+            return links
+        try:
+            conn = db.get_conn()
+            ph = ",".join("?" * len(bid_list))
+            link_rows = conn.execute(
+                f"SELECT l.batch_id, c.container_no FROM container_batch_link l "
+                f"JOIN containers c ON c.container_id = l.container_id "
+                f"WHERE l.batch_id IN ({ph})", bid_list).fetchall()
+        except Exception:
+            return links
+        from collections import defaultdict
+        groups = defaultdict(set)
+        for r in link_rows:
+            groups.setdefault(r["container_no"], set()).add(r["batch_id"])
+
+        def _sail_key(bid):
+            row = db.get_route(bid) or {}
+            return row.get("etd") or "9999-99-99"
+
+        cand_sorted = []
+        for cno, bids in groups.items():
+            if len(bids) < 2:
+                continue
+            ordered = sorted(bids, key=_sail_key)
+            cand_sorted.append((cno, ordered))
+        cand_sorted.sort(key=lambda x: _sail_key(x[1][0]))
+        for cno, ordered in cand_sorted:
+            for i in range(len(ordered) - 1):
+                links.append({"batch_a": ordered[i], "batch_b": ordered[i + 1],
+                              "container_no": cno})
+        return links
 
     def _overview_summary_text(self):
         """全批次顶栏汇总：N 批次 · 全提交 x · 未提交 y · 逾期节点 z。"""
@@ -481,6 +544,42 @@ class GanttWorkbenchWindow(QMainWindow):
             self._zoom_btns[key] = btn
             row2.addWidget(btn)
             btn.clicked.connect(lambda _=False, k=key: self.set_zoom(k))
+
+        # 全批次模式：轴模式（绝对日历 / 相对里程碑）+ 相对锚点
+        self._axis_label = QLabel("轴")
+        self._axis_label.setStyleSheet(f"font-size: 12px; color: {TEXT_TERTIARY};"
+                                       f" font-weight: 600;")
+        row2.addWidget(self._axis_label)
+        self._axis_group = QButtonGroup(self)
+        self._axis_btns = {}
+        for key, text, tip in (("abs", "绝对", "真实日历轴：今天线 + 周末 + 资源冲突竖带"),
+                               ("rel", "相对", "按锚点对齐（装船/到港/交付=第0天），比节奏")):
+            btn = QPushButton(text)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setMinimumHeight(30)
+            btn.setToolTip(tip)
+            btn.setStyleSheet(
+                f"QPushButton {{ background: {GRAY_SOFT}; color: {TEXT_SECONDARY};"
+                f" border: none; padding: 5px 12px; font-size: 12px; }}"
+                f"QPushButton:checked {{ background: {ACCENT_SOFT}; color: {ACCENT};"
+                f" font-weight: 600; }}")
+            self._axis_group.addButton(btn)
+            self._axis_btns[key] = btn
+            row2.addWidget(btn)
+            btn.clicked.connect(lambda _=False, k=key: self.set_axis_mode(k))
+        self._anchor_label = QLabel("对齐")
+        self._anchor_label.setStyleSheet(f"font-size: 12px; color: {TEXT_TERTIARY};"
+                                         f" font-weight: 600;")
+        row2.addWidget(self._anchor_label)
+        self._anchor_combo = QComboBox()
+        self._anchor_combo.setMinimumWidth(84)
+        self._anchor_combo.setCursor(Qt.PointingHandCursor)
+        self._anchor_combo.addItem("装船", "sail")
+        self._anchor_combo.addItem("到港", "arrive")
+        self._anchor_combo.addItem("交付", "deliver")
+        self._anchor_combo.currentIndexChanged.connect(self._on_axis_anchor_changed)
+        row2.addWidget(self._anchor_combo)
 
         row2.addStretch()
 
@@ -823,6 +922,8 @@ class GanttWorkbenchWindow(QMainWindow):
         self._mode_btns["merged"].setChecked(self.mode == "merged")
         for k, b in self._zoom_btns.items():
             b.setChecked(self.zoom == k)
+        for k, b in self._axis_btns.items():
+            b.setChecked(self._axis_mode == k)
 
         single = self.mode == "single"
         self._batch_label.setVisible(single)
@@ -833,6 +934,18 @@ class GanttWorkbenchWindow(QMainWindow):
         for b in self._zoom_btns.values():
             b.setVisible(not single)
         self._overview_summary.setVisible(not single)
+        # 轴模式/锚点：仅全批次总览显示；相对模式才激活锚点下拉
+        self._axis_label.setVisible(not single)
+        for b in self._axis_btns.values():
+            b.setVisible(not single)
+        any_axis = getattr(self, "_anchor_label", None)
+        if any_axis is not None:
+            self._anchor_label.setVisible(not single and self._axis_mode == "rel")
+            self._anchor_combo.setVisible(not single and self._axis_mode == "rel")
+        self._anchor_combo.blockSignals(True)
+        idx = max(0, self._anchor_combo.findData(self._axis_anchor))
+        self._anchor_combo.setCurrentIndex(idx)
+        self._anchor_combo.blockSignals(False)
 
         self._batch_combo.blockSignals(True)
         self._batch_combo.clear()
@@ -864,10 +977,12 @@ class GanttWorkbenchWindow(QMainWindow):
             self._overview_summary.setVisible(False)
         else:
             self._overview_summary.setText(self._overview_summary_text())
+            hit = "悬停菱形看里程碑 · 单击看详情 · 双击该行进入单批次操作（本总览只读）"
             self._hint.setText(
-                "全批次总览（只读）：行 = 批次，三段色块 = 境内/海运/境外的真实日历跨度，"
-                "左列显示单证提交状态，红色竖带 = 资源冲突窗口；"
-                "点某一行跳到该批次的单批次视图做操作。")
+                f"全批次总览（只读）：行=批次，弱色带=境内/海运/境外，菱形=里程碑"
+                f"（装船/交付大、提箱/到港小），细曲线=共柜衔接；{hit}。"
+                + ("「相对」轴按锚点（装船/到港/交付）对齐各批次节奏。" if self._axis_mode == "rel"
+                   else "「绝对」轴含今天线 / 周末 / 资源冲突竖带。"))
 
         has_nodes = bool(self._nodes)
         self._fill_btn.setVisible(not has_nodes and single)
@@ -929,13 +1044,32 @@ class GanttWorkbenchWindow(QMainWindow):
         _clear_layout(self._overview_host.layout())
 
         self._overview_data = self._overview_rows()
+        links = self._overview_links()
         overview = BatchOverviewGantt(self._overview_data, self._today, self.zoom,
-                                      self._conflicts)
-        overview.rowHovered.connect(self._on_overview_hover)
-        overview.rowActivated.connect(self._on_overview_row)
+                                      self._conflicts, links,
+                                      axis_mode=self._axis_mode,
+                                      anchor=self._axis_anchor,
+                                      interactive=False)   # 全批次总览纯展示：不响应悬停/单击/双击
         self._overview_host.layout().addWidget(overview)
         self._overview = overview
         self._gantt_grid = None
+        self._hover_info.setText("")
+
+        # 常驻图例：解释菱形颜色 / 三段带 / 金线 / 红虚线 / 交互，读图零成本
+        legend = QLabel(
+            "<span style='font-size:11px;color:#7A818E'>"
+            "◆<span style='color:#3D7BFF'>装船</span> · "
+            "◆<span style='color:#22A45D'>交付</span> · "
+            "◆<span style='color:#B9BFCB'>提箱/到港</span> · "
+            "<span style='color:#7A818E'>色带＝境内/海运/境外　"
+            "<span style='color:#E8A50C'>金色线＝今天</span>　"
+            "<span style='color:#FF3B30'>红色虚线带＝资源冲突</span></span>"
+            "</span>")
+        legend.setTextFormat(Qt.RichText)
+        legend.setContentsMargins(14, 6, 14, 6)
+        legend.setStyleSheet(
+            f"background: {GRAY_SOFT}; border-radius: 6px; color: {TEXT_SECONDARY};")
+        self._overview_host.layout().addWidget(legend)
 
     def _refresh_conflict_bar(self):
         _clear_layout(self._conflict_vbox)
@@ -993,6 +1127,25 @@ class GanttWorkbenchWindow(QMainWindow):
             self._overview.set_zoom(zoom)
         self._refresh_toolbar()
         self._save_state()
+
+    def set_axis_mode(self, mode):
+        if mode not in ("abs", "rel"):
+            return
+        self._axis_mode = mode
+        self._apply_axis_to_overview()
+        self._refresh_toolbar()
+        self._save_state()
+
+    def _on_axis_anchor_changed(self, idx):
+        if self._muted:
+            return
+        self._axis_anchor = self._anchor_combo.itemData(idx) or "sail"
+        self._apply_axis_to_overview()
+        self._refresh_toolbar()
+
+    def _apply_axis_to_overview(self):
+        if self._overview is not None:
+            self._overview.set_axis_mode(self._axis_mode, self._axis_anchor)
 
     def _on_project_changed(self, index):
         if self._muted or index < 0:
@@ -1098,36 +1251,6 @@ class GanttWorkbenchWindow(QMainWindow):
         if self._file_panel is not None:
             self._file_panel.focus_node(nid)
             self._file_panel.scroll_to_node(nid)
-
-    def _on_overview_hover(self, payload):
-        """全批次总览行悬停：显示该批次三段区间 + 提交状态明细。"""
-        if not payload:
-            self._hover_info.setText("")
-            return
-        spans = payload.get("spans") or {}
-        seg = " ｜ ".join(f"{k} {v}" for k, v in spans.items())
-        docs = payload.get("docs") or {}
-        proj = payload.get("proj") or {}
-        state = doc_state_text(docs.get("req_total", 0), docs.get("req_submitted", 0))
-        extra = f" · 项目级 {proj.get('submitted', 0)}/{proj.get('total')}" if proj.get("total") else ""
-        od = f" · 逾期 {payload['overdue']}" if payload.get("overdue") else ""
-        self._hover_info.setText(
-            f"{payload.get('batch_no')}：{state}{extra}{od} · {seg}")
-
-    def _on_overview_row(self, payload):
-        """点击总览某一行 → 切到该批次的单批次视图（那里才能操作）。"""
-        if not payload:
-            return
-        bid = payload.get("batch_id")
-        if not bid or bid == self._batch_id and self.mode == "single":
-            return
-        self._batch_id = bid
-        db.update_project(self._project_id, current_batch_id=bid)
-        self.mode = "single"
-        self._focused_node = None
-        self._load()
-        self._refresh_all()
-        self._notify_changed()
 
     def _node_waiting(self):
         out = {}

@@ -631,7 +631,7 @@ class NewProjectPage(QWidget):
             date_label.setFixedWidth(150)
             date_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             date_label.setStyleSheet(
-                f"font-size: 11px; color: {TEXT_TERTIARY}; font-variant-numeric: tabular-nums;")
+                f"font-size: 11px; color: {TEXT_TERTIARY};")
             rlayout.addWidget(date_label)
 
             self.schedule_layout.addWidget(row)

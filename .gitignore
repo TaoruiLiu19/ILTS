@@ -20,3 +20,12 @@ _ui_redesign_test.py
 # 本地审计/冒烟脚本与输出目录（不入库）
 _audit/
 _smoke_out/
+
+# 本轮调试/离屏渲染截图产物（不入库）
+_dbinspect.py
+_regress_out.txt
+_shot_ovr/
+_smoke_ovr.py
+_verify_api.py
+_verify_migrate.py
+_verify_schema.py
